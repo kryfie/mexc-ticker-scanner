@@ -45,6 +45,18 @@ class ScanResult:
     ma200_raw: int
     skipped_cooldown: int
     skipped_in_trade: int
+    avg_trade_pnl_pct: Optional[float]
+    avg_tp_pnl_pct: Optional[float]
+    avg_sl_pnl_pct: Optional[float]
+    avg_sl1_pnl_pct: Optional[float]
+    avg_sl2_pnl_pct: Optional[float]
+    avg_sl3_pnl_pct: Optional[float]
+    sum_profit_pct: Optional[float]
+    sum_loss_pct_abs: Optional[float]
+    profit_factor: Optional[float]
+    expectancy_pct: Optional[float]
+    avg_ma50_distance_entry_pct: Optional[float]
+    avg_ma50_distance_sl1_pct: Optional[float]
     sequence_last_30: str
     score: Optional[float]
 
@@ -278,7 +290,11 @@ def scan_symbol(
     max_leverage = meta.max_leverage if meta else None
 
     if len(df1) < 250 or len(df15) < 210:
-        empty_result = ScanResult(symbol, max_leverage, 0, 0, 0, None, None, 0, 0, 0, 0, 0, 0, "", None)
+        empty_result = ScanResult(
+            symbol, max_leverage, 0, 0, 0, None, None, 0, 0, 0, 0, 0, 0,
+            None, None, None, None, None, None, None, None, None, None, None, None,
+            "", None
+        )
         return empty_result, []
 
     df = prepare_data(df1, df15)
@@ -300,6 +316,7 @@ def scan_symbol(
 
     seq = []
     debug_trades: List[Dict[str, Any]] = []
+    trade_metric_rows: List[Dict[str, Any]] = []
 
     cooldown_seconds = cfg.cooldown_minutes * 60
 
@@ -476,6 +493,36 @@ def scan_symbol(
                 elif sl3_hit:
                     sl_type = "SL3 MA50 cross"
 
+            # Backtest exit price approximation:
+            # - TP closes at TP level
+            # - SL closes at the first-priority SL level, matching Pine priority: SL1 -> SL2 -> SL3
+            if result_tp:
+                exit_price = state["tp_price"]
+            elif sl1_hit:
+                exit_price = state["sl1_price"]
+            elif sl2_hit:
+                exit_price = state["sl2_price"]
+            elif sl3_hit:
+                exit_price = state["sl3_price"]
+            else:
+                exit_price = r.close
+
+            if direction == 1:
+                pnl_pct = (exit_price - state["entry_price"]) / state["entry_price"] * 100
+            else:
+                pnl_pct = (state["entry_price"] - exit_price) / state["entry_price"] * 100
+
+            ma50_distance_entry_pct = abs(state["entry_price"] - state["sl1_price"]) / state["entry_price"] * 100
+
+            trade_metric_rows.append(
+                {
+                    "result": result,
+                    "sl_type": sl_type,
+                    "pnl_pct": pnl_pct,
+                    "ma50_distance_entry_pct": ma50_distance_entry_pct,
+                }
+            )
+
             debug_trades.append(
                 {
                     "ticker": symbol,
@@ -484,6 +531,9 @@ def scan_symbol(
                     "exit_time_utc": pd.to_datetime(int(r.time), unit="s", utc=True),
                     "direction": "LONG" if direction == 1 else "SHORT",
                     "entry_price": state["entry_price"],
+                    "exit_price": exit_price,
+                    "pnl_pct": pnl_pct,
+                    "ma50_distance_entry_pct": ma50_distance_entry_pct,
                     "exit_candle_open": r.open,
                     "exit_candle_high": r.high,
                     "exit_candle_low": r.low,
@@ -523,9 +573,43 @@ def scan_symbol(
     wr = tp / closed * 100 if closed else None
     sl_rate = sl / closed * 100 if closed else None
 
+    metrics_df = pd.DataFrame(trade_metric_rows)
+
+    def _mean_pnl(mask) -> Optional[float]:
+        if metrics_df.empty:
+            return None
+        values = metrics_df.loc[mask, "pnl_pct"]
+        return float(values.mean()) if not values.empty else None
+
+    avg_trade_pnl_pct = float(metrics_df["pnl_pct"].mean()) if not metrics_df.empty else None
+    avg_tp_pnl_pct = _mean_pnl(metrics_df["result"] == "TP") if not metrics_df.empty else None
+    avg_sl_pnl_pct = _mean_pnl(metrics_df["result"] == "SL") if not metrics_df.empty else None
+    avg_sl1_pnl_pct = _mean_pnl(metrics_df["sl_type"] == "SL1 MA50 entry") if not metrics_df.empty else None
+    avg_sl2_pnl_pct = _mean_pnl(metrics_df["sl_type"] == "SL2 HA flat") if not metrics_df.empty else None
+    avg_sl3_pnl_pct = _mean_pnl(metrics_df["sl_type"] == "SL3 MA50 cross") if not metrics_df.empty else None
+
+    if not metrics_df.empty:
+        sum_profit_pct = float(metrics_df.loc[metrics_df["pnl_pct"] > 0, "pnl_pct"].sum())
+        sum_loss_pct_abs = float(-metrics_df.loc[metrics_df["pnl_pct"] < 0, "pnl_pct"].sum())
+        profit_factor = (sum_profit_pct / sum_loss_pct_abs) if sum_loss_pct_abs > 0 else None
+        expectancy_pct = avg_trade_pnl_pct
+        avg_ma50_distance_entry_pct = float(metrics_df["ma50_distance_entry_pct"].mean())
+        sl1_dist = metrics_df.loc[metrics_df["sl_type"] == "SL1 MA50 entry", "ma50_distance_entry_pct"]
+        avg_ma50_distance_sl1_pct = float(sl1_dist.mean()) if not sl1_dist.empty else None
+    else:
+        sum_profit_pct = None
+        sum_loss_pct_abs = None
+        profit_factor = None
+        expectancy_pct = None
+        avg_ma50_distance_entry_pct = None
+        avg_ma50_distance_sl1_pct = None
+
     score = None
     if closed:
-        score = wr + min(total, 40) * 0.5 - sl1 * 2.0
+        # Score now rewards actual expectancy and profit factor a bit more than raw WR.
+        pf_component = min(profit_factor or 0, 3) * 5
+        expectancy_component = (expectancy_pct or 0) * 10
+        score = wr + min(total, 40) * 0.5 - sl1 * 2.0 + pf_component + expectancy_component
 
     result = ScanResult(
         ticker=symbol,
@@ -541,6 +625,18 @@ def scan_symbol(
         ma200_raw=ma200_raw,
         skipped_cooldown=skipped_cooldown,
         skipped_in_trade=skipped_in_trade,
+        avg_trade_pnl_pct=avg_trade_pnl_pct,
+        avg_tp_pnl_pct=avg_tp_pnl_pct,
+        avg_sl_pnl_pct=avg_sl_pnl_pct,
+        avg_sl1_pnl_pct=avg_sl1_pnl_pct,
+        avg_sl2_pnl_pct=avg_sl2_pnl_pct,
+        avg_sl3_pnl_pct=avg_sl3_pnl_pct,
+        sum_profit_pct=sum_profit_pct,
+        sum_loss_pct_abs=sum_loss_pct_abs,
+        profit_factor=profit_factor,
+        expectancy_pct=expectancy_pct,
+        avg_ma50_distance_entry_pct=avg_ma50_distance_entry_pct,
+        avg_ma50_distance_sl1_pct=avg_ma50_distance_sl1_pct,
         sequence_last_30=" -> ".join(seq[-30:]),
         score=score,
     )
@@ -561,7 +657,7 @@ def main():
     parser.add_argument("--cooldown", type=int, default=180)
 
     parser.add_argument("--output", default="ranking.csv")
-    parser.add_argument("--debug-output", default="trades_debug.csv")
+    parser.add_argument("--debug-output", default=None, help="Optional. If set, saves per-trade debug CSV. Omit for faster/smaller production runs.")
 
     args = parser.parse_args()
 
@@ -627,27 +723,32 @@ def main():
 
     ranking_df.to_csv(args.output, index=False)
 
-    debug_df = pd.DataFrame(all_debug_trades)
+    if args.debug_output:
+        debug_df = pd.DataFrame(all_debug_trades)
 
-    if not debug_df.empty:
-        debug_df.to_csv(args.debug_output, index=False)
-    else:
-        pd.DataFrame(
-            columns=[
-                "ticker",
-                "max_leverage",
-                "entry_time_utc",
-                "exit_time_utc",
-                "direction",
-                "entry_price",
-                "result",
-                "sl_type",
-            ]
-        ).to_csv(args.debug_output, index=False)
+        if not debug_df.empty:
+            debug_df.to_csv(args.debug_output, index=False)
+        else:
+            pd.DataFrame(
+                columns=[
+                    "ticker",
+                    "max_leverage",
+                    "entry_time_utc",
+                    "exit_time_utc",
+                    "direction",
+                    "entry_price",
+                    "exit_price",
+                    "pnl_pct",
+                    "ma50_distance_entry_pct",
+                    "result",
+                    "sl_type",
+                ]
+            ).to_csv(args.debug_output, index=False)
 
     print(ranking_df.head(30).to_string(index=False))
     print(f"\nSaved ranking: {args.output}")
-    print(f"Saved debug trades: {args.debug_output}")
+    if args.debug_output:
+        print(f"Saved debug trades: {args.debug_output}")
 
 
 if __name__ == "__main__":
