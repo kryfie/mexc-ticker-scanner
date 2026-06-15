@@ -1,0 +1,31 @@
+name: MEXC Scanner Test
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * *"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scanner for SUI
+        run: python mexc_scanner.py --symbols SUI_USDT --days 14 --output ranking.csv
+
+      - name: Upload ranking
+        uses: actions/upload-artifact@v4
+        with:
+          name: ranking
+          path: ranking.csv
