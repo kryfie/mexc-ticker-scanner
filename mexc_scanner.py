@@ -1,7 +1,7 @@
 import argparse
 import time
 from dataclasses import dataclass, asdict
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 import pandas as pd
 import requests
@@ -19,8 +19,21 @@ class ScanConfig:
 
 
 @dataclass
+class ContractMeta:
+    ticker: str
+    max_leverage: Optional[int] = None
+    base_coin: Optional[str] = None
+    quote_coin: Optional[str] = None
+    contract_size: Optional[float] = None
+    min_vol: Optional[float] = None
+    price_scale: Optional[int] = None
+    amount_scale: Optional[int] = None
+
+
+@dataclass
 class ScanResult:
     ticker: str
+    max_leverage: Optional[int]
     entries: int
     tp: int
     sl: int
@@ -46,13 +59,94 @@ def mexc_get(path: str, params: Optional[dict] = None) -> dict:
     return data
 
 
-def get_contract_symbols(limit: Optional[int] = None) -> List[str]:
+def _to_int(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_float(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_max_leverage(row: Dict[str, Any]) -> Optional[int]:
+    """Robust extraction because MEXC field names may differ by endpoint/version."""
+    candidates = [
+        row.get("maxLeverage"),
+        row.get("max_leverage"),
+        row.get("maxLever"),
+        row.get("leverageMax"),
+        row.get("maxLongLeverage"),
+        row.get("maxShortLeverage"),
+    ]
+    values = [_to_int(x) for x in candidates]
+    values = [x for x in values if x is not None]
+    return max(values) if values else None
+
+
+def get_contract_meta() -> Dict[str, ContractMeta]:
+    data = mexc_get("/api/v1/contract/detail")
+    rows = data.get("data", [])
+    meta: Dict[str, ContractMeta] = {}
+
+    for row in rows:
+        symbol = row.get("symbol")
+        if not symbol:
+            continue
+
+        meta[symbol] = ContractMeta(
+            ticker=symbol,
+            max_leverage=extract_max_leverage(row),
+            base_coin=row.get("baseCoin"),
+            quote_coin=row.get("quoteCoin"),
+            contract_size=_to_float(row.get("contractSize")),
+            min_vol=_to_float(row.get("minVol")),
+            price_scale=_to_int(row.get("priceScale")),
+            amount_scale=_to_int(row.get("amountScale")),
+        )
+
+    return meta
+
+
+def get_contract_symbols(
+    limit: Optional[int] = None,
+    min_max_leverage: Optional[int] = None,
+    meta: Optional[Dict[str, ContractMeta]] = None,
+) -> List[str]:
     data = mexc_get("/api/v1/contract/detail")
     rows = data.get("data", [])
     symbols = []
+
+    if meta is None:
+        meta = get_contract_meta()
+
     for x in rows:
-        if x.get("state") == 0 and x.get("quoteCoin") == "USDT" and x.get("apiAllowed", True):
-            symbols.append(x["symbol"])
+        symbol = x.get("symbol")
+        if not symbol:
+            continue
+
+        is_enabled = x.get("state") == 0
+        is_usdt = x.get("quoteCoin") == "USDT"
+        api_allowed = x.get("apiAllowed", True)
+        max_lev = meta.get(symbol, ContractMeta(symbol)).max_leverage
+
+        if not (is_enabled and is_usdt and api_allowed):
+            continue
+
+        if min_max_leverage is not None:
+            if max_lev is None or max_lev < min_max_leverage:
+                continue
+
+        symbols.append(symbol)
+
     symbols = sorted(set(symbols))
     return symbols[:limit] if limit else symbols
 
@@ -169,18 +263,22 @@ def reset_trade_state() -> Dict[str, Any]:
     }
 
 
-def scan_symbol(symbol: str, cfg: ScanConfig) -> tuple[ScanResult, List[Dict[str, Any]]]:
+def scan_symbol(
+    symbol: str,
+    cfg: ScanConfig,
+    meta: Optional[ContractMeta] = None,
+) -> Tuple[ScanResult, List[Dict[str, Any]]]:
     end = int(time.time())
     start = end - cfg.days * 24 * 60 * 60
-
-    # Long warmup for MA and HA stability.
     warmup_start = start - 30 * 24 * 60 * 60
 
     df1 = fetch_klines(symbol, "Min1", warmup_start, end)
     df15 = fetch_klines(symbol, "Min15", warmup_start, end)
 
+    max_leverage = meta.max_leverage if meta else None
+
     if len(df1) < 250 or len(df15) < 210:
-        empty_result = ScanResult(symbol, 0, 0, 0, None, None, 0, 0, 0, 0, 0, 0, "", None)
+        empty_result = ScanResult(symbol, max_leverage, 0, 0, 0, None, None, 0, 0, 0, 0, 0, 0, "", None)
         return empty_result, []
 
     df = prepare_data(df1, df15)
@@ -381,6 +479,7 @@ def scan_symbol(symbol: str, cfg: ScanConfig) -> tuple[ScanResult, List[Dict[str
             debug_trades.append(
                 {
                     "ticker": symbol,
+                    "max_leverage": max_leverage,
                     "entry_time_utc": pd.to_datetime(state["entry_time"], unit="s", utc=True),
                     "exit_time_utc": pd.to_datetime(int(r.time), unit="s", utc=True),
                     "direction": "LONG" if direction == 1 else "SHORT",
@@ -430,6 +529,7 @@ def scan_symbol(symbol: str, cfg: ScanConfig) -> tuple[ScanResult, List[Dict[str
 
     result = ScanResult(
         ticker=symbol,
+        max_leverage=max_leverage,
         entries=total,
         tp=tp,
         sl=sl,
@@ -454,6 +554,7 @@ def main():
     parser.add_argument("--symbols", nargs="*", help="Examples: SUI_USDT ONDO_USDT VELVET_USDT")
     parser.add_argument("--all", action="store_true", help="Scan all enabled USDT futures")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of symbols when using --all")
+    parser.add_argument("--min-max-leverage", type=int, default=None, help="Scan only symbols with max leverage >= this value, e.g. 100")
 
     parser.add_argument("--days", type=int, default=14)
     parser.add_argument("--tp", type=float, default=1.2)
@@ -470,22 +571,43 @@ def main():
         days=args.days,
     )
 
+    print("Loading MEXC contract metadata...")
+    meta_map = get_contract_meta()
+
     symbols = args.symbols or []
 
     if args.all:
-        symbols = get_contract_symbols(args.limit)
+        symbols = get_contract_symbols(
+            limit=args.limit,
+            min_max_leverage=args.min_max_leverage,
+            meta=meta_map,
+        )
+    elif args.min_max_leverage is not None:
+        before = len(symbols)
+        symbols = [
+            s for s in symbols
+            if meta_map.get(s) and meta_map[s].max_leverage is not None and meta_map[s].max_leverage >= args.min_max_leverage
+        ]
+        skipped = before - len(symbols)
+        if skipped:
+            print(f"Skipped {skipped} symbol(s) because max leverage < {args.min_max_leverage} or metadata missing.")
 
     if not symbols:
-        raise SystemExit("Podaj --symbols SUI_USDT ONDO_USDT albo użyj --all")
+        raise SystemExit("Podaj --symbols SUI_USDT ONDO_USDT albo użyj --all. Dla filtra użyj np. --all --min-max-leverage 100")
+
+    print(f"Symbols to scan: {len(symbols)}")
+    if args.min_max_leverage is not None:
+        print(f"Leverage filter: max_leverage >= {args.min_max_leverage}")
 
     results = []
     all_debug_trades = []
 
     for n, symbol in enumerate(symbols, start=1):
-        print(f"[{n}/{len(symbols)}] scanning {symbol}...")
+        max_lev = meta_map.get(symbol).max_leverage if meta_map.get(symbol) else None
+        print(f"[{n}/{len(symbols)}] scanning {symbol} | max_leverage={max_lev}...")
 
         try:
-            result, debug_trades = scan_symbol(symbol, cfg)
+            result, debug_trades = scan_symbol(symbol, cfg, meta_map.get(symbol))
             results.append(asdict(result))
             all_debug_trades.extend(debug_trades)
 
@@ -513,6 +635,7 @@ def main():
         pd.DataFrame(
             columns=[
                 "ticker",
+                "max_leverage",
                 "entry_time_utc",
                 "exit_time_utc",
                 "direction",
