@@ -22,7 +22,7 @@ jobs:
         run: |
           pip install -r requirements.txt
 
-      - name: Run scanner for SUI
+      - name: Scan all futures x100+
         run: |
           python mexc_scanner.py --all --min-max-leverage 100 --days 7 --limit 10 --output ranking.csv --debug-output trades_debug.csv
 
