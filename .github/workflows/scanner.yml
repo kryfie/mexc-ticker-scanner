@@ -24,7 +24,7 @@ jobs:
 
       - name: Run scanner for SUI
         run: |
-          python mexc_scanner.py --symbols SUI_USDT --days 14 --output ranking.csv --debug-output trades_debug.csv
+          python mexc_scanner.py --symbols SUI_USDT --days 7 --output ranking.csv --debug-output trades_debug.csv
 
       - name: Show generated files
         run: |
