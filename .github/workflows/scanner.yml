@@ -24,7 +24,7 @@ jobs:
 
       - name: Scan all futures x100+
         run: |
-          python -u mexc_scanner.py --symbols BEAT_USDT --days 30 --output ranking.csv --debug-output trades_debug.csv
+          python -u mexc_scanner.py --symbols ADA_USDT --days 30 --output ranking.csv --debug-output trades_debug.csv
 
       - name: Show generated files
         run: |
