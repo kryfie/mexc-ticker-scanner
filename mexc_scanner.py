@@ -137,7 +137,7 @@ def scan_symbol(symbol: str, cfg: ScanConfig) -> ScanResult:
     end = int(time.time())
     start = end - cfg.days * 24 * 60 * 60
     # Need extra M15 history for MA200 = 200*15m = 50h.
-    warmup_start = start - 3 * 24 * 60 * 60
+    warmup_start = start - 30 * 24 * 60 * 60
 
     df1 = fetch_klines(symbol, "Min1", warmup_start, end)
     df15 = fetch_klines(symbol, "Min15", warmup_start, end)
