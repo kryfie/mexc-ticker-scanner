@@ -24,7 +24,8 @@ jobs:
 
       - name: Scan all futures x100+
         run: |
-         python -u mexc_scanner.py --all --min-max-leverage 100 --days 7 --output ranking.csv
+         #python -u mexc_scanner.py --all --min-max-leverage 100 --days 7 --output ranking.csv
+         python -u mexc_scanner.py --symbols ONDO_USDT MCDSTOCK_USDT XRP_USDT ZRO_USDT --days 7 --output ranking_missing.csv
 
       - name: Show generated files
         run: |
