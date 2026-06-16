@@ -24,9 +24,7 @@ jobs:
 
       - name: Scan all futures x100+
         run: |
-          # python -u mexc_scanner.py --all --min-max-leverage 100 --days 7 --output ranking.csv
-          # python -u mexc_scanner.py --symbols OPENLEDGER_USDT BRETT_USDT FOLKS_USDT KAIA_USDT ADA_USDT SAND_USDT SUI_USDT ONDO_USDT BTC_USDT ETH_USDT SWARMS_USDT BAN_USDT RIF_USDT INJ_USDT --days 30 --output ranking.csv
-          python -u mexc_scanner.py --symbols OPENLEDGER_USDT --days 7 --output ranking.csv --debug-output trades_debug.csv
+         python -u mexc_scanner.py --all --min-max-leverage 100 --days 7 --output ranking.csv
 
       - name: Show generated files
         run: |
