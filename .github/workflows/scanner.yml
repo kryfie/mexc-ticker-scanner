@@ -8,6 +8,7 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 480
 
     steps:
       - name: Checkout repo
@@ -22,10 +23,9 @@ jobs:
         run: |
           pip install -r requirements.txt
 
-      - name: Scan all futures x100+
+      - name: Scan all futures x100+ 30d
         run: |
-         #python -u mexc_scanner.py --all --min-max-leverage 100 --days 7 --output ranking.csv
-         python -u mexc_scanner.py --symbols SAND_USDT KAIA_USDT VET_USDT BAN_USDT BRETT_USDT OPENLEDGER_USDT PENDLE_USDT KAS_USDT FOLKS_USDT UNI_USDT PAXG_USDT HBAR_USDT ATOM_USDT IOTA_USDT NIL_USDT 1000BONK_USDT ADA_USDT BCH_USDT TIA_USDT THETA_USDT --days 30 --output ranking.csv
+          python -u mexc_scanner.py --all --min-max-leverage 100 --days 30 --output ranking.csv
 
       - name: Show generated files
         run: |
@@ -38,7 +38,7 @@ jobs:
       - name: Upload files
         uses: actions/upload-artifact@v4
         with:
-          name: scanner-output
+          name: scanner-output-30d
           path: |
             ranking.csv
             trades_debug.csv
