@@ -715,9 +715,13 @@ def main():
     ranking_df = pd.DataFrame(results)
 
     if not ranking_df.empty:
+        # Production ranking: prioritize actual profitability metrics over raw win rate.
+        # profit_factor = total winning % / total losing %
+        # expectancy_pct = average PnL % per trade
+        # entries = sample size / reliability
         ranking_df = ranking_df.sort_values(
-            ["score", "entries"],
-            ascending=[False, False],
+            ["profit_factor", "expectancy_pct", "entries"],
+            ascending=[False, False, False],
             na_position="last",
         )
 
