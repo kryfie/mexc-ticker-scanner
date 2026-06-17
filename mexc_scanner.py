@@ -12,7 +12,7 @@ BASE_URL = "https://api.mexc.com"
 @dataclass
 class ScanConfig:
     tp_percent: float = 1.2
-    cooldown_minutes: int = 180
+    cooldown_minutes: int = 480
     conservative_same_candle: bool = True
     check_result_on_entry_bar: bool = False
     days: int = 14
@@ -610,7 +610,7 @@ def main():
     parser.add_argument("--min-max-leverage", type=int, default=None, help="Scan only symbols with max leverage >= this value, e.g. 100")
     parser.add_argument("--days", type=int, default=14)
     parser.add_argument("--tp", type=float, default=1.2)
-    parser.add_argument("--cooldown", type=int, default=180)
+    parser.add_argument("--cooldown", type=int, default=480)
     parser.add_argument("--output", default="ranking.csv")
     parser.add_argument("--debug-output", default=None, help="Optional. If set, saves per-trade debug CSV. Omit for faster/smaller production runs.")
     args = parser.parse_args()
