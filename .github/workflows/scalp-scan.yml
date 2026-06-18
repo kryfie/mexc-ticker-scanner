@@ -7,14 +7,18 @@ on:
         description: "MEXC interval: Min1, Min5, Min15, Min30, Min60, Hour4, Day1"
         required: true
         default: "Min1"
-      candles:
-        description: "Number of candles, max 2000"
+      days:
+        description: "How many recent days to analyze"
         required: true
-        default: "2000"
+        default: "7"
       min_trades:
         description: "Minimum closed trades to include in ranking"
         required: true
         default: "1"
+      min_symbol_leverage:
+        description: "Only scan tickers with max leverage at least this value"
+        required: true
+        default: "100"
   schedule:
     # Co godzine. GitHub Actions moze miec opoznienia.
     - cron: "0 * * * *"
@@ -42,8 +46,9 @@ jobs:
         run: |
           python scalp_scan_mexc.py \
             --interval "${{ github.event.inputs.interval || 'Min1' }}" \
-            --candles "${{ github.event.inputs.candles || '2000' }}" \
+            --days "${{ github.event.inputs.days || '7' }}" \
             --min-trades "${{ github.event.inputs.min_trades || '1' }}" \
+            --min-symbol-leverage "${{ github.event.inputs.min_symbol_leverage || '100' }}" \
             --out-dir reports
 
       - name: Upload reports
