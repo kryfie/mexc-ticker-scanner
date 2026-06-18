@@ -1,0 +1,54 @@
+name: MEXC Scalping Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      interval:
+        description: "MEXC interval: Min1, Min5, Min15, Min30, Min60, Hour4, Day1"
+        required: true
+        default: "Min1"
+      candles:
+        description: "Number of candles, max 2000"
+        required: true
+        default: "2000"
+      min_trades:
+        description: "Minimum closed trades to include in ranking"
+        required: true
+        default: "1"
+  schedule:
+    # Co godzine. GitHub Actions moze miec opoznienia.
+    - cron: "0 * * * *"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scanner
+        run: |
+          python scalp_scan_mexc.py \
+            --interval "${{ github.event.inputs.interval || 'Min1' }}" \
+            --candles "${{ github.event.inputs.candles || '2000' }}" \
+            --min-trades "${{ github.event.inputs.min_trades || '1' }}" \
+            --out-dir reports
+
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: scalp-reports
+          path: reports/
+          retention-days: 14
