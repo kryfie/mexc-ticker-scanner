@@ -2,15 +2,19 @@
 """
 MEXC Futures scalping strategy scanner/backtester.
 
-Port 1:1 z PineScript "Scalping Strategy":
+Port logiki PineScript "Scalping Strategy":
 - SMA12/SMA50/SMA200
 - Heikin Ashi
 - MA stretch + spike candle
 - pierwsza plaska swieca HA reversal po spike
 - symulacja TP/SL z zasada preferSLifBothHit
 
-Domyslnie skanuje wszystkie aktywne kontrakty USDT z MEXC Futures i zapisuje ranking do CSV.
-To NIE sklada zlecen. To tylko analiza/backtest/sygnały.
+Dodatkowo:
+- skanuje tylko kontrakty USDT z maxLeverage >= min-symbol-leverage, domyslnie x100
+- analizuje ostatnie N dni, domyslnie 7
+- zapisuje tylko 2 pliki: latest_scalp_ranking.csv oraz scalp_trades_<interval>_<timestamp>.csv
+
+To NIE sklada zlecen. To tylko analiza/backtest/sygnaly.
 """
 
 from __future__ import annotations
@@ -29,12 +33,13 @@ import pandas as pd
 import requests
 
 BASE_URL = "https://api.mexc.com"
+MAX_KLINES_PER_REQUEST = 2000
 
 
 @dataclasses.dataclass
 class Params:
     interval: str = "Min1"
-    candles: int = 2000
+    days: int = 7
     tp_roi_percent: float = 20.0
     leverage: float = 75.0
     min_dist_12_50: float = 0.30
@@ -43,9 +48,10 @@ class Params:
     max_bars_after_spike: int = 5
     prefer_sl_if_both_hit: bool = True
     quote_coin: str = "USDT"
-    max_workers: int = 8
-    request_sleep: float = 0.03
+    max_workers: int = 6
+    request_sleep: float = 0.05
     min_trades: int = 1
+    min_symbol_leverage: int = 100
 
 
 @dataclasses.dataclass
@@ -63,7 +69,7 @@ class Trade:
     dist_12_200: Optional[float] = None
 
 
-def get_json(path: str, params: Optional[Dict[str, Any]] = None, timeout: int = 20) -> Dict[str, Any]:
+def get_json(path: str, params: Optional[Dict[str, Any]] = None, timeout: int = 25) -> Dict[str, Any]:
     url = BASE_URL + path
     r = requests.get(url, params=params, timeout=timeout)
     r.raise_for_status()
@@ -73,13 +79,26 @@ def get_json(path: str, params: Optional[Dict[str, Any]] = None, timeout: int = 
     return data
 
 
-def fetch_symbols(quote_coin: str = "USDT") -> List[str]:
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def fetch_symbols(quote_coin: str = "USDT", min_symbol_leverage: int = 100) -> List[str]:
     data = get_json("/api/v1/contract/detail/country")
     rows = data.get("data", [])
     if isinstance(rows, dict):
         rows = [rows]
-    symbols = []
+
+    symbols: List[str] = []
+    skipped_low_leverage = 0
+
     for item in rows:
+        max_leverage = safe_int(item.get("countryConfigContractMaxLeverage"), 0) or safe_int(item.get("maxLeverage"), 0)
         if (
             item.get("quoteCoin") == quote_coin
             and item.get("state") == 0
@@ -87,37 +106,13 @@ def fetch_symbols(quote_coin: str = "USDT") -> List[str]:
             and not item.get("isHidden", False)
             and item.get("symbol")
         ):
-            symbols.append(item["symbol"])
+            if max_leverage >= min_symbol_leverage:
+                symbols.append(item["symbol"])
+            else:
+                skipped_low_leverage += 1
+
+    print(f"Symbols after leverage filter x{min_symbol_leverage}+: {len(symbols)} | skipped lower leverage: {skipped_low_leverage}")
     return sorted(set(symbols))
-
-
-def fetch_klines(symbol: str, interval: str, candles: int) -> pd.DataFrame:
-    # MEXC zwraca max 2000 punktow. Dla prostoty pobieramy ostatnie `candles` przez end=now.
-    end = int(time.time())
-    seconds_per_bar = interval_to_seconds(interval)
-    start = end - seconds_per_bar * min(candles, 2000)
-    data = get_json(
-        f"/api/v1/contract/kline/{symbol}",
-        params={"interval": interval, "start": start, "end": end},
-    ).get("data", {})
-
-    if not data or not data.get("time"):
-        return pd.DataFrame()
-
-    df = pd.DataFrame(
-        {
-            "time": data["time"],
-            "open": data["open"],
-            "high": data["high"],
-            "low": data["low"],
-            "close": data["close"],
-            "vol": data.get("vol", [math.nan] * len(data["time"])),
-        }
-    )
-    df = df.sort_values("time").drop_duplicates("time").reset_index(drop=True)
-    for col in ["open", "high", "low", "close", "vol"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df.dropna(subset=["open", "high", "low", "close"])
 
 
 def interval_to_seconds(interval: str) -> int:
@@ -136,6 +131,48 @@ def interval_to_seconds(interval: str) -> int:
     if interval not in mapping:
         raise ValueError(f"Unsupported interval: {interval}. Use one of: {', '.join(mapping)}")
     return mapping[interval]
+
+
+def fetch_klines(symbol: str, interval: str, days: int) -> pd.DataFrame:
+    """Fetch last N days. MEXC returns max ~2000 candles per request, so we page by time."""
+    seconds_per_bar = interval_to_seconds(interval)
+    end_all = int(time.time())
+    start_all = end_all - int(days * 86400)
+    max_span = seconds_per_bar * MAX_KLINES_PER_REQUEST
+
+    frames: List[pd.DataFrame] = []
+    start = start_all
+
+    while start < end_all:
+        end = min(start + max_span, end_all)
+        data = get_json(
+            f"/api/v1/contract/kline/{symbol}",
+            params={"interval": interval, "start": start, "end": end},
+        ).get("data", {})
+
+        if data and data.get("time"):
+            frames.append(
+                pd.DataFrame(
+                    {
+                        "time": data["time"],
+                        "open": data["open"],
+                        "high": data["high"],
+                        "low": data["low"],
+                        "close": data["close"],
+                        "vol": data.get("vol", [math.nan] * len(data["time"])),
+                    }
+                )
+            )
+        start = end + seconds_per_bar
+
+    if not frames:
+        return pd.DataFrame()
+
+    df = pd.concat(frames, ignore_index=True)
+    df = df.sort_values("time").drop_duplicates("time").reset_index(drop=True)
+    for col in ["open", "high", "low", "close", "vol"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.dropna(subset=["open", "high", "low", "close"])
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -157,7 +194,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     out["haGreen"] = out["haClose"] > out["haOpen"]
     out["haRed"] = out["haClose"] < out["haOpen"]
-    # Pine uzywa rownosci. W Pythonie dodajemy mala tolerancje, zeby floaty nie psuly porownan.
     eps = 1e-12
     out["haNoLowerWick"] = (out["haLow"] - out[["haOpen", "haClose"]].min(axis=1)).abs() <= eps
     out["haNoUpperWick"] = (out["haHigh"] - out[["haOpen", "haClose"]].max(axis=1)).abs() <= eps
@@ -296,7 +332,9 @@ def run_strategy(symbol: str, raw_df: pd.DataFrame, p: Params) -> Tuple[Dict[str
     result = {
         "symbol": symbol,
         "interval": p.interval,
+        "days": p.days,
         "candles": len(df),
+        "min_symbol_leverage": p.min_symbol_leverage,
         "total_trades": total_trades,
         "closed_trades": closed_trades,
         "tp": tp_count,
@@ -321,7 +359,7 @@ def run_strategy(symbol: str, raw_df: pd.DataFrame, p: Params) -> Tuple[Dict[str
 def scan_one(symbol: str, p: Params) -> Tuple[Optional[Dict[str, Any]], List[Trade], Optional[str]]:
     try:
         time.sleep(p.request_sleep)
-        df = fetch_klines(symbol, p.interval, p.candles)
+        df = fetch_klines(symbol, p.interval, p.days)
         if df.empty or len(df) < 210:
             return None, [], f"{symbol}: not enough candles"
         result, trades = run_strategy(symbol, df, p)
@@ -331,9 +369,7 @@ def scan_one(symbol: str, p: Params) -> Tuple[Optional[Dict[str, Any]], List[Tra
 
 
 def trades_to_df(trades: Iterable[Trade]) -> pd.DataFrame:
-    rows = []
-    for t in trades:
-        rows.append(dataclasses.asdict(t))
+    rows = [dataclasses.asdict(t) for t in trades]
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
@@ -347,7 +383,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Scan MEXC Futures tickers with Scalping Strategy")
     parser.add_argument("--symbols", default="", help="Comma-separated symbols, e.g. BTC_USDT,ETH_USDT. Empty = all MEXC USDT futures.")
     parser.add_argument("--interval", default="Min1")
-    parser.add_argument("--candles", type=int, default=2000)
+    parser.add_argument("--days", type=int, default=7, help="How many recent days to analyze. Default: 7.")
     parser.add_argument("--tp-roi-percent", type=float, default=20.0)
     parser.add_argument("--leverage", type=float, default=75.0)
     parser.add_argument("--min-dist-12-50", type=float, default=0.30)
@@ -355,14 +391,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--min-spike-pct", type=float, default=0.50)
     parser.add_argument("--max-bars-after-spike", type=int, default=5)
     parser.add_argument("--prefer-tp-if-both-hit", action="store_true", help="Opposite of Pine default. If same candle hits TP and SL, count TP.")
-    parser.add_argument("--max-workers", type=int, default=8)
+    parser.add_argument("--max-workers", type=int, default=6)
     parser.add_argument("--min-trades", type=int, default=1)
+    parser.add_argument("--min-symbol-leverage", type=int, default=100, help="Only scan contracts with maxLeverage >= this value. Default: 100.")
     parser.add_argument("--out-dir", default="reports")
     args = parser.parse_args(argv)
 
     p = Params(
         interval=args.interval,
-        candles=min(args.candles, 2000),
+        days=max(1, args.days),
         tp_roi_percent=args.tp_roi_percent,
         leverage=args.leverage,
         min_dist_12_50=args.min_dist_12_50,
@@ -372,6 +409,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         prefer_sl_if_both_hit=not args.prefer_tp_if_both_hit,
         max_workers=args.max_workers,
         min_trades=args.min_trades,
+        min_symbol_leverage=args.min_symbol_leverage,
     )
 
     out_dir = Path(args.out_dir)
@@ -380,9 +418,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.symbols.strip():
         symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     else:
-        symbols = fetch_symbols(p.quote_coin)
+        symbols = fetch_symbols(p.quote_coin, p.min_symbol_leverage)
 
-    print(f"Scanning {len(symbols)} symbols | interval={p.interval} candles={p.candles}")
+    print(f"Scanning {len(symbols)} symbols | interval={p.interval} days={p.days} min_leverage=x{p.min_symbol_leverage}")
 
     results: List[Dict[str, Any]] = []
     all_trades: List[Trade] = []
@@ -409,11 +447,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     ranking = ranking.sort_values(["score", "winrate_pct", "closed_trades"], ascending=[False, False, False])
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    ranking_path = out_dir / f"scalp_ranking_{p.interval}_{ts}.csv"
-    trades_path = out_dir / f"scalp_trades_{p.interval}_{ts}.csv"
     latest_path = out_dir / "latest_scalp_ranking.csv"
+    trades_path = out_dir / f"scalp_trades_{p.interval}_{ts}.csv"
 
-    ranking.to_csv(ranking_path, index=False)
     ranking.to_csv(latest_path, index=False)
     trades_df = trades_to_df(all_trades)
     if not trades_df.empty:
@@ -421,15 +457,19 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print("\nTOP 30:")
     cols = ["symbol", "closed_trades", "tp", "sl", "winrate_pct", "long_count", "short_count", "latest_signal", "open_trade", "score"]
-    print(ranking[cols].head(30).to_string(index=False))
-    print(f"\nSaved: {ranking_path}")
-    print(f"Saved: {latest_path}")
+    if ranking.empty:
+        print("No symbols passed min_trades filter.")
+    else:
+        print(ranking[cols].head(30).to_string(index=False))
+
+    print(f"\nSaved: {latest_path}")
     if not trades_df.empty:
         print(f"Saved: {trades_path}")
     if errors:
-        err_path = out_dir / f"errors_{ts}.txt"
-        err_path.write_text("\n".join(errors), encoding="utf-8")
-        print(f"Errors: {len(errors)} saved to {err_path}")
+        # Nie wrzucamy trzeciego pliku raportowego. Pokazujemy tylko pierwsze bledy w logu Actions.
+        print(f"\nErrors: {len(errors)}")
+        for e in errors[:30]:
+            print("ERR", e)
     return 0
 
 
