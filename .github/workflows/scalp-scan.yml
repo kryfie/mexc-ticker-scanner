@@ -3,6 +3,10 @@ name: MEXC Scalping Scan
 on:
   workflow_dispatch:
     inputs:
+      ticker:
+        description: "Optional ticker/symbol, e.g. BEAT or BEAT_USDT. Empty = scan all eligible MEXC USDT futures"
+        required: false
+        default: ""
       interval:
         description: "MEXC interval: Min1, Min5, Min15, Min30, Min60, Hour4, Day1"
         required: true
@@ -19,6 +23,10 @@ on:
         description: "Only scan tickers with max leverage at least this value"
         required: true
         default: "100"
+      max_workers:
+        description: "Parallel workers. Use lower value if MEXC rate-limits the scan"
+        required: true
+        default: "6"
   schedule:
     # Co godzine. GitHub Actions moze miec opoznienia.
     - cron: "0 * * * *"
@@ -43,12 +51,21 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run scanner
+        shell: bash
         run: |
+          TICKER="${{ github.event.inputs.ticker || '' }}"
+          SYMBOLS_ARG=""
+          if [ -n "$TICKER" ]; then
+            SYMBOLS_ARG="--symbols $TICKER"
+          fi
+
           python scalp_scan_mexc.py \
+            $SYMBOLS_ARG \
             --interval "${{ github.event.inputs.interval || 'Min1' }}" \
             --days "${{ github.event.inputs.days || '7' }}" \
             --min-trades "${{ github.event.inputs.min_trades || '1' }}" \
             --min-symbol-leverage "${{ github.event.inputs.min_symbol_leverage || '100' }}" \
+            --max-workers "${{ github.event.inputs.max_workers || '6' }}" \
             --out-dir reports
 
       - name: Upload reports
