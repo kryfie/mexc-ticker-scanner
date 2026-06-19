@@ -2,12 +2,16 @@
 """
 MEXC Futures scalping strategy scanner/backtester.
 
-Port logiki PineScript "Scalping Strategy":
+Port logiki PineScript "Scalping Strategy - TREND FOLLOWING BOT - 5 CANDLE ENTRY":
 - SMA12/SMA50/SMA200
 - Heikin Ashi
-- MA stretch + spike candle
-- pierwsza plaska swieca HA reversal po spike
+- trend following: MA12 najwyzej dla LONG, MA12 najnizej dla SHORT
+- S1 pullback do MA12
+- wejscie max 5 swiec po S1 na plaskiej HA
+- SL = plaska krawedz swiecy wejscia
 - symulacja TP/SL z zasada preferSLifBothHit
+
+Wazne: aktualny Pine NIE wysyla TP w webhooku i NIE ma SL2.
 
 Dodatkowo:
 - skanuje tylko kontrakty USDT z maxLeverage >= min-symbol-leverage, domyslnie x100
@@ -23,7 +27,6 @@ import argparse
 import concurrent.futures as futures
 import dataclasses
 import math
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -133,6 +136,16 @@ def interval_to_seconds(interval: str) -> int:
     return mapping[interval]
 
 
+
+def normalize_symbol(symbol: str, quote_coin: str = "USDT") -> str:
+    """Allow workflow input like BEAT, BEAT_USDT, beat/usdt."""
+    s = symbol.strip().upper().replace("/", "_").replace("-", "_")
+    if not s:
+        return s
+    if "_" not in s:
+        return f"{s}_{quote_coin}"
+    return s
+
 def fetch_klines(symbol: str, interval: str, days: int) -> pd.DataFrame:
     """Fetch last N days. MEXC returns max ~2000 candles per request, so we page by time."""
     seconds_per_bar = interval_to_seconds(interval)
@@ -231,11 +244,15 @@ def run_strategy(symbol: str, raw_df: pd.DataFrame, p: Params) -> Tuple[Dict[str
         dist_12_200 = abs(r["ma12"] - r["ma200"]) / r["close"] * 100.0
         ma_distance_ok = dist_12_50 >= p.min_dist_12_50 and dist_12_200 >= p.min_dist_12_200
 
-        short_trend_stretch = r["ma12"] > r["ma50"] and r["ma50"] > r["ma200"] and ma_distance_ok
-        long_trend_stretch = r["ma12"] < r["ma50"] and r["ma50"] < r["ma200"] and ma_distance_ok
+        # NEW PINE: TREND FOLLOWING LOGIC
+        # SHORT: MA12 is lowest (downtrend), S1 is green pullback reaching MA12.
+        # LONG:  MA12 is highest (uptrend), S1 is red pullback reaching MA12.
+        # Pine currently keeps minSpikePct as input, but the active condition is >= 0 after reaching MA12.
+        short_trend_stretch = r["ma12"] < r["ma50"] and r["ma50"] < r["ma200"] and ma_distance_ok
+        long_trend_stretch = r["ma12"] > r["ma50"] and r["ma50"] > r["ma200"] and ma_distance_ok
 
-        short_spike_candle = bool(short_trend_stretch and r["haGreen"] and ((r["haHigh"] - r["ma12"]) / r["ma12"] * 100.0 >= p.min_spike_pct))
-        long_spike_candle = bool(long_trend_stretch and r["haRed"] and ((r["ma12"] - r["haLow"]) / r["ma12"] * 100.0 >= p.min_spike_pct))
+        short_spike_candle = bool(short_trend_stretch and r["haGreen"] and r["haHigh"] >= r["ma12"] and ((r["haHigh"] - r["ma12"]) / r["ma12"] * 100.0 >= 0.0))
+        long_spike_candle = bool(long_trend_stretch and r["haRed"] and r["haLow"] <= r["ma12"] and ((r["ma12"] - r["haLow"]) / r["ma12"] * 100.0 >= 0.0))
 
         if short_spike_candle:
             short_spike_bar = i
@@ -266,6 +283,7 @@ def run_strategy(symbol: str, raw_df: pd.DataFrame, p: Params) -> Tuple[Dict[str
             latest_signal = "SCALP_LONG_ENTRY"
             trades.append(Trade(symbol, "LONG", int(r["time"]), entry_price, sl_price, tp_price, dist_12_50=dist_12_50, dist_12_200=dist_12_200))
 
+
         if new_short_entry:
             in_trade = True
             direction = -1
@@ -276,6 +294,7 @@ def run_strategy(symbol: str, raw_df: pd.DataFrame, p: Params) -> Tuple[Dict[str
             short_count += 1
             latest_signal = "SCALP_SHORT_ENTRY"
             trades.append(Trade(symbol, "SHORT", int(r["time"]), entry_price, sl_price, tp_price, dist_12_50=dist_12_50, dist_12_200=dist_12_200))
+
 
         if short_scalp or (short_spike_bar is not None and i - short_spike_bar > p.max_bars_after_spike):
             short_spike_bar = None
@@ -388,7 +407,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--leverage", type=float, default=75.0)
     parser.add_argument("--min-dist-12-50", type=float, default=0.30)
     parser.add_argument("--min-dist-12-200", type=float, default=0.60)
-    parser.add_argument("--min-spike-pct", type=float, default=0.50)
+    parser.add_argument("--min-spike-pct", type=float, default=0.50, help="Kept for compatibility; current new Pine S1 uses pullback to MA12 with >=0 spike.")
     parser.add_argument("--max-bars-after-spike", type=int, default=5)
     parser.add_argument("--prefer-tp-if-both-hit", action="store_true", help="Opposite of Pine default. If same candle hits TP and SL, count TP.")
     parser.add_argument("--max-workers", type=int, default=6)
@@ -416,7 +435,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.symbols.strip():
-        symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+        symbols = [normalize_symbol(s, p.quote_coin) for s in args.symbols.split(",") if s.strip()]
     else:
         symbols = fetch_symbols(p.quote_coin, p.min_symbol_leverage)
 
