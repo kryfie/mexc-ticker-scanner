@@ -25,7 +25,7 @@ jobs:
 
       - name: Scan all futures x100+ 30d
         run: |
-          python -u mexc_scanner.py --all --min-max-leverage 100 --days 3 --output ranking.csv --debug-output trades_debug.csv
+          python -u mexc_scanner.py --all --min-max-leverage 100 --days 3 --tp 5 --output ranking.csv --debug-output trades_debug.csv
 
       - name: Show generated files
         run: |
