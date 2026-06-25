@@ -225,7 +225,7 @@ def crossunder(a_prev, a, b_prev, b) -> bool:
     return a_prev >= b_prev and a < b
 
 
-def prepare_data(df1: pd.DataFrame, df15: pd.DataFrame) -> pd.DataFrame:
+def prepare_data(df1: pd.DataFrame) -> pd.DataFrame:
     df = df1.copy()
     df["dt"] = pd.to_datetime(df["time"], unit="s", utc=True)
 
@@ -246,23 +246,6 @@ def prepare_data(df1: pd.DataFrame, df15: pd.DataFrame) -> pd.DataFrame:
     df["ha_high"] = df[["high", "ha_open", "ha_close"]].max(axis=1)
     df["ha_low"] = df[["low", "ha_open", "ha_close"]].min(axis=1)
 
-    m15 = df15.copy()
-    m15["dt15"] = pd.to_datetime(m15["time"], unit="s", utc=True)
-    m15["m15_open"] = m15["open"]
-    m15["m15_high"] = m15["high"]
-    m15["m15_low"] = m15["low"]
-    m15["m15_close"] = m15["close"]
-    m15["m15_ma12"] = m15["close"].rolling(12).mean()
-    m15["m15_ma200"] = m15["close"].rolling(200).mean()
-    m15 = m15[["dt15", "m15_open", "m15_high", "m15_low", "m15_close", "m15_ma12", "m15_ma200"]].dropna()
-
-    df = pd.merge_asof(
-        df.sort_values("dt"),
-        m15.sort_values("dt15"),
-        left_on="dt",
-        right_on="dt15",
-        direction="backward",
-    )
     return df.reset_index(drop=True)
 
 
@@ -305,10 +288,9 @@ def scan_symbol(symbol: str, cfg: ScanConfig, meta: Optional[ContractMeta] = Non
     warmup_start = start - 30 * 24 * 60 * 60
 
     df1 = fetch_klines(symbol, "Min1", warmup_start, end)
-    df15 = fetch_klines(symbol, "Min15", warmup_start, end)
     max_leverage = meta.max_leverage if meta else None
 
-    if len(df1) < 250 or len(df15) < 210:
+    if len(df1) < 250:
         empty_result = ScanResult(
             symbol, max_leverage, 0, 0, 0, None, None, 0, 0, 0, 0, 0, 0,
             None, None, None, None, None, None, None, None, None, None, None, None,
@@ -316,7 +298,7 @@ def scan_symbol(symbol: str, cfg: ScanConfig, meta: Optional[ContractMeta] = Non
         )
         return empty_result, []
 
-    df = prepare_data(df1, df15)
+    df = prepare_data(df1)
     df = df[df["time"] >= start].reset_index(drop=True)
 
     state = reset_trade_state()
@@ -331,10 +313,7 @@ def scan_symbol(symbol: str, cfg: ScanConfig, meta: Optional[ContractMeta] = Non
     for i in range(1, len(df)):
         r = df.iloc[i]
         p = df.iloc[i - 1]
-        needed = [
-            r.ma12, r.ma50, r.ma200, p.ma12, p.ma50, p.ma200,
-            r.m15_open, r.m15_high, r.m15_low, r.m15_close, r.m15_ma12, r.m15_ma200,
-        ]
+        needed = [r.ma12, r.ma50, r.ma200, p.ma12, p.ma50, p.ma200]
         if any(pd.isna(x) for x in needed):
             continue
 
@@ -343,17 +322,6 @@ def scan_symbol(symbol: str, cfg: ScanConfig, meta: Optional[ContractMeta] = Non
         ha_no_lower = abs(r.ha_low - min(r.ha_open, r.ha_close)) < 1e-12
         ha_no_upper = abs(r.ha_high - max(r.ha_open, r.ha_close)) < 1e-12
 
-        m15_long_trend = r.m15_close > r.m15_ma200
-        m15_short_trend = r.m15_close < r.m15_ma200
-        m15_dist = abs(r.m15_ma12 - r.m15_ma200) / r.m15_close * 100
-        m15_strong = m15_dist > 7.5
-
-        # Updated Pine Script M15 wick filter.
-        m15_no_lower_wick_above_ma200 = r.m15_open > r.m15_ma200 and r.m15_low >= r.m15_ma200
-        m15_no_upper_wick_below_ma200 = r.m15_open < r.m15_ma200 and r.m15_high <= r.m15_ma200
-
-        allow_long = m15_long_trend or (m15_short_trend and m15_strong)
-        allow_short = m15_short_trend or (m15_long_trend and m15_strong)
 
         cross_ma12_up = crossover(p.ma12, r.ma12, p.ma200, r.ma200)
         cross_ma12_down = crossunder(p.ma12, r.ma12, p.ma200, r.ma200)
@@ -362,25 +330,21 @@ def scan_symbol(symbol: str, cfg: ScanConfig, meta: Optional[ContractMeta] = Non
         cross_ha_up = crossover(p.ha_close, r.ha_close, p.ma200, r.ma200)
         cross_ha_down = crossunder(p.ha_close, r.ha_close, p.ma200, r.ma200)
 
-        long_signal = allow_long and cross_ma12_up and r.ma50 < r.ma12 and r.ma50 < r.ma200
-        short_signal = allow_short and cross_ma12_down and r.ma50 > r.ma12 and r.ma50 > r.ma200
+        long_signal = cross_ma12_up and r.ma50 < r.ma12 and r.ma50 < r.ma200
+        short_signal = cross_ma12_down and r.ma50 > r.ma12 and r.ma50 > r.ma200
 
-        ma50_up = allow_long and cross_ma50_up and r.ma12 > r.ma50 and r.ma12 > r.ma200
-        ma50_down = allow_short and cross_ma50_down and r.ma12 < r.ma50 and r.ma12 < r.ma200
+        ma50_up = cross_ma50_up and r.ma12 > r.ma50 and r.ma12 > r.ma200
+        ma50_down = cross_ma50_down and r.ma12 < r.ma50 and r.ma12 < r.ma200
 
         ma200_up_raw = (
-            allow_long
-            and m15_no_lower_wick_above_ma200
-            and ha_green
+            ha_green
             and ha_no_lower
             and cross_ha_up
             and r.ma50 < r.ma12
             and r.ma12 < r.ma200
         )
         ma200_down_raw = (
-            allow_short
-            and m15_no_upper_wick_below_ma200
-            and ha_red
+            ha_red
             and ha_no_upper
             and cross_ha_down
             and r.ma50 > r.ma12
