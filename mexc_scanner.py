@@ -11,8 +11,8 @@ BASE_URL = "https://api.mexc.com"
 
 @dataclass
 class ScanConfig:
-    tp_percent: float = 1.2
-    cooldown_minutes: int = 480
+    tp_percent: float = 7.0
+    cooldown_minutes: int = 720
     conservative_same_candle: bool = True
     check_result_on_entry_bar: bool = False
     days: int = 14
