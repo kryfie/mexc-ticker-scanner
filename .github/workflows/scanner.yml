@@ -8,7 +8,7 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 480
+    timeout-minutes: 720
 
     steps:
       - name: Checkout repo
@@ -25,7 +25,7 @@ jobs:
 
       - name: Scan all futures x100+ 30d
         run: |
-          python -u mexc_scanner.py --all --min-max-leverage 100 --days 3 --tp 5 --output ranking.csv --debug-output trades_debug.csv
+          python -u mexc_scanner.py --all --min-max-leverage 50 --days 7 --tp 7 --output ranking.csv --debug-output trades_debug.csv
 
       - name: Show generated files
         run: |
