@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-MTF Pullback Quality v7 Multi-Variant Scanner for MEXC USDT-M perpetual futures.
+MTF Pullback Quality v8 Robust Multi-Window Scanner for MEXC USDT-M perpetual futures.
 
-Multi-variant diagnostic model based on Pine MTF Pullback Quality Strategy v6 — 3R.
+Robust multi-window diagnostic model based on Pine MTF Pullback Quality Strategy v6 — 3R.
     M15 -> fresh directional regime with age/slope/stretch limits
     M5  -> controlled pullback
     M1  -> micro-touch + breakout quality trigger
@@ -10,14 +10,16 @@ Multi-variant diagnostic model based on Pine MTF Pullback Quality Strategy v6 �
     TP  -> minimum 3R from simulated fill price
 
 Outputs:
-    v7_variants_scorecard.csv
-    v7_variants_period_summary.csv
-    v7_variants_ticker_summary.csv
-    v7_variants_trades.csv
-    v7_variants_rejections.csv
-    v7_variants_equity.csv
-    v7_variants_open.csv
-    v7_variants_config.json
+    v8_robust_scorecard.csv
+    v8_robust_window_summary.csv
+    v8_robust_ticker_summary.csv
+    v8_robust_trades.csv
+    v8_robust_rejections.csv
+    v8_robust_equity.csv
+    v8_robust_open.csv
+    v8_robust_primary_leave_one_ticker_out.csv
+    v8_robust_errors.csv
+    v8_robust_config.json
 
 The scanner uses only public MEXC market endpoints. No API key is required.
 """
@@ -49,6 +51,8 @@ INTERVAL_SECONDS = {
     "Min5": 5 * 60,
     "Min15": 15 * 60,
 }
+
+PRIMARY_VARIANT_NAME = "C_RVD_CORE"
 
 
 @dataclass(frozen=True)
@@ -185,7 +189,7 @@ class MexcPublicClient:
         self.session = requests.Session()
         self.session.headers.update(
             {
-                "User-Agent": "mtf-pullback-quality-v7-variants/1.0",
+                "User-Agent": "mtf-pullback-quality-v8-robust-windows/1.0",
                 "Accept": "application/json",
             }
         )
@@ -1011,85 +1015,88 @@ def max_streak(values: Iterable[bool], target: bool) -> int:
 
 
 def build_variants() -> List[VariantSpec]:
-    """Variants isolate each hypothesis before combining them."""
+    """Test the primary Range+Volume+Depth hypothesis and close alternatives."""
     return [
         VariantSpec(
             name="A_BASE_V6_3R",
             description="Exact v6 baseline: pure SL or 3R TP.",
         ),
         VariantSpec(
-            name="B_EMA50_08",
-            description="Baseline + entry at least 0.80 ATR from M1 EMA50.",
-            min_m1_distance_ema50_atr=0.80,
-        ),
-        VariantSpec(
-            name="C_RANGE_11",
-            description="Baseline + M1 trigger range at least 1.10 of average.",
+            name="B_RANGE_DEPTH",
+            description="M1 range >= 1.10 and M5 pullback depth <= 1.70 ATR.",
             min_m1_range_ratio=1.10,
+            max_m5_pullback_depth_atr=1.70,
         ),
         VariantSpec(
-            name="D_PULLBACK_QUALITY",
-            description="Baseline + quiet/shallow M5 pullback.",
+            name=PRIMARY_VARIANT_NAME,
+            description="PRIMARY: M1 range >= 1.10, M5 volume <= 0.90 and depth <= 1.70 ATR.",
+            min_m1_range_ratio=1.10,
             max_m5_volume_ratio=0.90,
             max_m5_pullback_depth_atr=1.70,
         ),
         VariantSpec(
-            name="E_ALL_FILTERS",
-            description="All four quality filters, pure SL or 3R TP.",
-            max_m5_volume_ratio=0.90,
-            max_m5_pullback_depth_atr=1.70,
-            min_m1_range_ratio=1.10,
+            name="D_EMA50_RANGE_DEPTH",
+            description="EMA50 distance >= 0.80 ATR plus range >= 1.10 and depth <= 1.70 ATR.",
             min_m1_distance_ema50_atr=0.80,
+            min_m1_range_ratio=1.10,
+            max_m5_pullback_depth_atr=1.70,
         ),
         VariantSpec(
-            name="F_ALL_SHORT_ONLY",
-            description="All filters, SHORT signals only.",
+            name="E_RVD_SHORT_ONLY",
+            description="Primary Range+Volume+Depth filters, SHORT signals only.",
             allow_long=False,
             allow_short=True,
+            min_m1_range_ratio=1.10,
             max_m5_volume_ratio=0.90,
             max_m5_pullback_depth_atr=1.70,
-            min_m1_range_ratio=1.10,
-            min_m1_distance_ema50_atr=0.80,
         ),
         VariantSpec(
-            name="G_ALL_LONG_ONLY",
-            description="All filters, LONG signals only.",
+            name="F_RVD_LONG_ONLY",
+            description="Primary Range+Volume+Depth filters, LONG signals only.",
             allow_long=True,
             allow_short=False,
+            min_m1_range_ratio=1.10,
             max_m5_volume_ratio=0.90,
             max_m5_pullback_depth_atr=1.70,
-            min_m1_range_ratio=1.10,
-            min_m1_distance_ema50_atr=0.80,
         ),
         VariantSpec(
-            name="H_ALL_BE_AT_1_5R",
-            description="All filters; after 1.5R move stop to entry for next bar.",
+            name="G_RVD_BE_AT_1_5R",
+            description="Primary filters; after 1.5R move stop to entry from next M1 bar.",
+            min_m1_range_ratio=1.10,
             max_m5_volume_ratio=0.90,
             max_m5_pullback_depth_atr=1.70,
-            min_m1_range_ratio=1.10,
-            min_m1_distance_ema50_atr=0.80,
             protect_trigger_r=1.50,
             protect_lock_r=0.00,
         ),
         VariantSpec(
-            name="I_ALL_BE_AT_2R",
-            description="All filters; after 2R move stop to entry for next bar.",
+            name="H_RVD_LOCK_0_5R_AT_2R",
+            description="Primary filters; after 2R lock +0.5R from next M1 bar.",
+            min_m1_range_ratio=1.10,
             max_m5_volume_ratio=0.90,
             max_m5_pullback_depth_atr=1.70,
-            min_m1_range_ratio=1.10,
-            min_m1_distance_ema50_atr=0.80,
-            protect_trigger_r=2.00,
-            protect_lock_r=0.00,
-        ),
-        VariantSpec(
-            name="J_ALL_LOCK_0_5R_AT_2R",
-            description="All filters; after 2R lock +0.5R for next bar.",
-            max_m5_volume_ratio=0.90,
-            max_m5_pullback_depth_atr=1.70,
-            min_m1_range_ratio=1.10,
-            min_m1_distance_ema50_atr=0.80,
             protect_trigger_r=2.00,
             protect_lock_r=0.50,
+        ),
+        VariantSpec(
+            name="I_RVD_RANGE_12",
+            description="Primary filters with stricter M1 trigger range >= 1.20.",
+            min_m1_range_ratio=1.20,
+            max_m5_volume_ratio=0.90,
+            max_m5_pullback_depth_atr=1.70,
+        ),
+        VariantSpec(
+            name="J_RVD_VOLUME_08",
+            description="Primary filters with quieter M5 pullback volume <= 0.80.",
+            min_m1_range_ratio=1.10,
+            max_m5_volume_ratio=0.80,
+            max_m5_pullback_depth_atr=1.70,
+        ),
+        VariantSpec(
+            name="K_RVD_DEPTH_15",
+            description="Primary filters with shallower M5 pullback depth <= 1.50 ATR.",
+            min_m1_range_ratio=1.10,
+            max_m5_volume_ratio=0.90,
+            max_m5_pullback_depth_atr=1.50,
         ),
     ]
 
@@ -1487,34 +1494,61 @@ def prepare_symbol_data(
     return m1[(m1["time"] >= start_time) & (m1["time"] <= end_time)].sort_index()
 
 
-def period_summary_rows(
+def build_test_windows(
+    end_time: int,
+    window_days: int,
+    window_count: int,
+) -> List[Dict[str, Any]]:
+    """Create contiguous independent windows, oldest first."""
+    seconds = window_days * 24 * 60 * 60
+    total_start = end_time - seconds * window_count
+    windows: List[Dict[str, Any]] = []
+    for index in range(window_count):
+        start = total_start + index * seconds
+        end = start + seconds
+        if index == window_count - 1:
+            end = end_time
+        windows.append({
+            "window": f"W{index + 1}_{window_days}D",
+            "window_index": index + 1,
+            "start_time": start,
+            "end_time": end,
+            "start_time_utc": pd.to_datetime(start, unit="s", utc=True),
+            "end_time_utc": pd.to_datetime(end, unit="s", utc=True),
+        })
+    return windows
+
+
+def window_summary_rows(
     trades: pd.DataFrame,
     variants: List[VariantSpec],
-    start_time: int,
-    end_time: int,
+    windows: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    midpoint = start_time + (end_time - start_time) // 2
-    periods = [
-        ("FULL", start_time, end_time + 1),
-        ("FIRST_HALF", start_time, midpoint),
-        ("SECOND_HALF", midpoint, end_time + 1),
-    ]
     rows: List[Dict[str, Any]] = []
+    window_names = [window["window"] for window in windows]
 
     for variant in variants:
-        variant_frame = trades.loc[trades["variant"] == variant.name].copy() if not trades.empty else trades
-        for period_name, period_start, period_end in periods:
-            if variant_frame.empty:
-                period_frame = variant_frame
-            else:
-                entry_seconds = pd.to_datetime(variant_frame["entry_time_utc"], utc=True).astype("int64") // 10**9
-                period_frame = variant_frame.loc[(entry_seconds >= period_start) & (entry_seconds < period_end)]
+        variant_frame = (
+            trades.loc[trades["variant"] == variant.name].copy()
+            if not trades.empty else trades
+        )
+        for window_name in ["ALL_WINDOWS", *window_names]:
+            window_frame = (
+                variant_frame
+                if window_name == "ALL_WINDOWS"
+                else variant_frame.loc[variant_frame["window"] == window_name]
+            )
             for scope in ("ALL", "LONG", "SHORT"):
-                scoped = period_frame if scope == "ALL" else period_frame.loc[period_frame["direction"] == scope]
+                scoped = (
+                    window_frame
+                    if scope == "ALL"
+                    else window_frame.loc[window_frame["direction"] == scope]
+                )
                 row = {
                     "variant": variant.name,
                     "description": variant.description,
-                    "period": period_name,
+                    "is_primary_candidate": variant.name == PRIMARY_VARIANT_NAME,
+                    "window": window_name,
                     "scope": scope,
                 }
                 row.update(summarize_trade_frame(scoped))
@@ -1522,70 +1556,195 @@ def period_summary_rows(
     return rows
 
 
-def build_scorecard(period_summary: pd.DataFrame) -> pd.DataFrame:
-    rows: List[Dict[str, Any]] = []
-    for (variant, scope), group in period_summary.groupby(["variant", "scope"], dropna=False):
-        lookup = group.set_index("period")
-        def value(period: str, column: str) -> Any:
-            return lookup.at[period, column] if period in lookup.index else None
+def _metric_value(lookup: pd.DataFrame, window: str, column: str) -> Any:
+    return lookup.at[window, column] if window in lookup.index else None
 
-        first_exp = value("FIRST_HALF", "expectancy_net_r")
-        second_exp = value("SECOND_HALF", "expectancy_net_r")
-        full_exp = value("FULL", "expectancy_net_r")
-        first_exp_num = float(first_exp) if pd.notna(first_exp) else -999.0
-        second_exp_num = float(second_exp) if pd.notna(second_exp) else -999.0
-        full_trades = int(value("FULL", "trades") or 0)
-        min_half_exp = min(first_exp_num, second_exp_num)
-        stability_gap = abs(first_exp_num - second_exp_num) if first_exp_num > -900 and second_exp_num > -900 else None
-        robust_score = (
-            min_half_exp * math.sqrt(max(full_trades, 1))
-            if first_exp_num > -900 and second_exp_num > -900 else None
-        )
-        rows.append({
+
+def build_robust_scorecard(
+    window_summary: pd.DataFrame,
+    windows: List[Dict[str, Any]],
+) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    window_names = [window["window"] for window in windows]
+
+    for (variant, scope), group in window_summary.groupby(["variant", "scope"], dropna=False):
+        lookup = group.set_index("window")
+        total_trades = int(_metric_value(lookup, "ALL_WINDOWS", "trades") or 0)
+        total_expectancy = _metric_value(lookup, "ALL_WINDOWS", "expectancy_net_r")
+        total_pf = _metric_value(lookup, "ALL_WINDOWS", "profit_factor_net_r")
+        total_net = float(_metric_value(lookup, "ALL_WINDOWS", "net_r") or 0.0)
+        total_dd = float(_metric_value(lookup, "ALL_WINDOWS", "max_drawdown_r") or 0.0)
+
+        expectations: List[float] = []
+        nets: List[float] = []
+        trades_per_window: List[int] = []
+        description = str(group["description"].iloc[0]) if "description" in group.columns else ""
+        row: Dict[str, Any] = {
             "variant": variant,
+            "description": description,
             "scope": scope,
-            "full_trades": full_trades,
-            "full_tp": value("FULL", "tp"),
-            "full_sl": value("FULL", "sl"),
-            "full_be": value("FULL", "be"),
-            "full_lock": value("FULL", "lock"),
-            "full_pf": value("FULL", "profit_factor_net_r"),
-            "full_expectancy_r": full_exp,
-            "full_net_r": value("FULL", "net_r"),
-            "full_drawdown_r": value("FULL", "max_drawdown_r"),
-            "first_trades": value("FIRST_HALF", "trades"),
-            "first_pf": value("FIRST_HALF", "profit_factor_net_r"),
-            "first_expectancy_r": first_exp,
-            "first_net_r": value("FIRST_HALF", "net_r"),
-            "second_trades": value("SECOND_HALF", "trades"),
-            "second_pf": value("SECOND_HALF", "profit_factor_net_r"),
-            "second_expectancy_r": second_exp,
-            "second_net_r": value("SECOND_HALF", "net_r"),
-            "both_halves_positive": bool(first_exp_num > 0 and second_exp_num > 0),
-            "min_half_expectancy_r": min_half_exp if min_half_exp > -900 else None,
-            "half_expectancy_gap": stability_gap,
+            "is_primary_candidate": variant == PRIMARY_VARIANT_NAME,
+            "total_trades": total_trades,
+            "total_tp": int(_metric_value(lookup, "ALL_WINDOWS", "tp") or 0),
+            "total_sl": int(_metric_value(lookup, "ALL_WINDOWS", "sl") or 0),
+            "total_be": int(_metric_value(lookup, "ALL_WINDOWS", "be") or 0),
+            "total_lock": int(_metric_value(lookup, "ALL_WINDOWS", "lock") or 0),
+            "total_pf": total_pf,
+            "total_expectancy_r": total_expectancy,
+            "total_net_r": total_net,
+            "total_drawdown_r": total_dd,
+        }
+
+        for window_name in window_names:
+            trades_value = int(_metric_value(lookup, window_name, "trades") or 0)
+            expectancy_value = _metric_value(lookup, window_name, "expectancy_net_r")
+            net_value = float(_metric_value(lookup, window_name, "net_r") or 0.0)
+            pf_value = _metric_value(lookup, window_name, "profit_factor_net_r")
+            trades_per_window.append(trades_value)
+            nets.append(net_value)
+            if expectancy_value is not None and pd.notna(expectancy_value):
+                expectations.append(float(expectancy_value))
+
+            prefix = window_name.lower()
+            row[f"{prefix}_trades"] = trades_value
+            row[f"{prefix}_pf"] = pf_value
+            row[f"{prefix}_expectancy_r"] = expectancy_value
+            row[f"{prefix}_net_r"] = net_value
+
+        positive_windows = sum(1 for value in nets if value > 0)
+        nonnegative_windows = sum(1 for value in nets if value >= 0)
+        windows_with_trades = sum(1 for value in trades_per_window if value > 0)
+        min_expectancy = min(expectations) if expectations else None
+        avg_expectancy = float(np.mean(expectations)) if expectations else None
+        expectancy_std = float(np.std(expectations, ddof=0)) if expectations else None
+        worst_net = min(nets) if nets else None
+        best_net = max(nets) if nets else None
+
+        expectancy_num = float(total_expectancy) if total_expectancy is not None and pd.notna(total_expectancy) else -99.0
+        min_exp_num = float(min_expectancy) if min_expectancy is not None else -99.0
+        stability_penalty = float(expectancy_std or 0.0)
+        sample_bonus = math.log1p(total_trades) * 0.15
+        drawdown_penalty = abs(total_dd) * 0.03
+        robust_score = (
+            expectancy_num
+            + 1.5 * min_exp_num
+            + 0.35 * positive_windows
+            + sample_bonus
+            - stability_penalty
+            - drawdown_penalty
+        )
+
+        if windows_with_trades == len(window_names) and positive_windows == len(window_names) and total_trades >= 20 and expectancy_num > 0:
+            decision = "STRONG"
+        elif windows_with_trades == len(window_names) and positive_windows == len(window_names) and expectancy_num > 0:
+            decision = "PROMISING_SMALL_SAMPLE"
+        elif positive_windows >= max(2, len(window_names) - 1) and total_net > 0:
+            decision = "MIXED_POSITIVE"
+        else:
+            decision = "WEAK"
+
+        row.update({
+            "windows_with_trades": windows_with_trades,
+            "positive_windows": positive_windows,
+            "nonnegative_windows": nonnegative_windows,
+            "all_windows_positive": positive_windows == len(window_names),
+            "min_window_expectancy_r": min_expectancy,
+            "avg_window_expectancy_r": avg_expectancy,
+            "window_expectancy_std": expectancy_std,
+            "worst_window_net_r": worst_net,
+            "best_window_net_r": best_net,
+            "decision": decision,
             "robust_score": robust_score,
         })
+        rows.append(row)
+
     result = pd.DataFrame(rows)
     if not result.empty:
         result = result.sort_values(
-            ["scope", "both_halves_positive", "robust_score", "full_trades"],
-            ascending=[True, False, False, False],
+            ["scope", "all_windows_positive", "positive_windows", "robust_score", "total_trades"],
+            ascending=[True, False, False, False, False],
             na_position="last",
         )
     return result
 
 
-def ticker_summary_rows(trades: pd.DataFrame, variants: List[VariantSpec], symbols: List[str]) -> List[Dict[str, Any]]:
+def ticker_summary_rows(
+    trades: pd.DataFrame,
+    variants: List[VariantSpec],
+    symbols: List[str],
+    windows: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
+    window_names = [window["window"] for window in windows]
     for variant in variants:
         for symbol in symbols:
-            subset = trades.loc[(trades["variant"] == variant.name) & (trades["ticker"] == symbol)] if not trades.empty else trades
-            for scope in ("ALL", "LONG", "SHORT"):
-                scoped = subset if scope == "ALL" else subset.loc[subset["direction"] == scope]
-                row = {"variant": variant.name, "ticker": symbol, "scope": scope}
-                row.update(summarize_trade_frame(scoped))
-                rows.append(row)
+            subset = (
+                trades.loc[(trades["variant"] == variant.name) & (trades["ticker"] == symbol)]
+                if not trades.empty else trades
+            )
+            for window_name in ["ALL_WINDOWS", *window_names]:
+                window_subset = (
+                    subset if window_name == "ALL_WINDOWS"
+                    else subset.loc[subset["window"] == window_name]
+                )
+                for scope in ("ALL", "LONG", "SHORT"):
+                    scoped = (
+                        window_subset if scope == "ALL"
+                        else window_subset.loc[window_subset["direction"] == scope]
+                    )
+                    row = {
+                        "variant": variant.name,
+                        "is_primary_candidate": variant.name == PRIMARY_VARIANT_NAME,
+                        "ticker": symbol,
+                        "window": window_name,
+                        "scope": scope,
+                    }
+                    row.update(summarize_trade_frame(scoped))
+                    rows.append(row)
+    return rows
+
+
+def leave_one_ticker_out_rows(
+    trades: pd.DataFrame,
+    symbols: List[str],
+    windows: List[Dict[str, Any]],
+    primary_variant: str = PRIMARY_VARIANT_NAME,
+) -> List[Dict[str, Any]]:
+    primary = (
+        trades.loc[trades["variant"] == primary_variant].copy()
+        if not trades.empty else trades
+    )
+    window_names = [window["window"] for window in windows]
+    rows: List[Dict[str, Any]] = []
+
+    for excluded in ["NONE", *symbols]:
+        reduced = (
+            primary if excluded == "NONE" or primary.empty
+            else primary.loc[primary["ticker"] != excluded]
+        )
+        aggregate = summarize_trade_frame(reduced)
+        row: Dict[str, Any] = {
+            "primary_variant": primary_variant,
+            "excluded_ticker": excluded,
+            **aggregate,
+        }
+        window_nets: List[float] = []
+        for window_name in window_names:
+            scoped = (
+                reduced.loc[reduced["window"] == window_name]
+                if not reduced.empty else reduced
+            )
+            metrics = summarize_trade_frame(scoped)
+            prefix = window_name.lower()
+            row[f"{prefix}_trades"] = metrics["trades"]
+            row[f"{prefix}_pf"] = metrics["profit_factor_net_r"]
+            row[f"{prefix}_expectancy_r"] = metrics["expectancy_net_r"]
+            row[f"{prefix}_net_r"] = metrics["net_r"]
+            window_nets.append(float(metrics["net_r"]))
+        row["positive_windows"] = sum(1 for value in window_nets if value > 0)
+        row["all_windows_positive"] = all(value > 0 for value in window_nets)
+        row["worst_window_net_r"] = min(window_nets) if window_nets else None
+        rows.append(row)
     return rows
 
 
@@ -1593,14 +1752,14 @@ def equity_rows(trades: pd.DataFrame) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     if trades.empty:
         return rows
-    for variant, group in trades.groupby("variant"):
+    for (variant, window), group in trades.groupby(["variant", "window"]):
         ordered = group.sort_values("exit_time_utc").copy().reset_index(drop=True)
         ordered["trade_number"] = np.arange(1, len(ordered) + 1)
         ordered["cumulative_r"] = ordered["pnl_r_net"].cumsum()
         ordered["peak_r"] = ordered["cumulative_r"].cummax().clip(lower=0.0)
         ordered["drawdown_r"] = ordered["cumulative_r"] - ordered["peak_r"]
         rows.extend(ordered[[
-            "variant", "exit_time_utc", "ticker", "trade_number", "direction",
+            "variant", "window", "exit_time_utc", "ticker", "trade_number", "direction",
             "exit_reason", "pnl_r_net", "cumulative_r", "drawdown_r"
         ]].to_dict("records"))
     return rows
@@ -1613,32 +1772,43 @@ def csv_or_empty(rows: List[Dict[str, Any]], columns: Sequence[str], path: Path)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare v6 baseline, quality filters and BE/lock management on MEXC data."
+        description=(
+            "Test the primary Range+Volume+Depth candidate and close alternatives "
+            "across independent MEXC windows."
+        )
     )
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--all", action="store_true")
     source.add_argument("--symbols", nargs="+")
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--days", type=int, default=30)
+    parser.add_argument("--window-days", type=int, default=30)
+    parser.add_argument("--window-count", type=int, default=3)
     parser.add_argument("--warmup-days", type=int, default=7)
     parser.add_argument("--rr", type=float, default=3.0)
     parser.add_argument("--commission-percent", type=float, default=0.06)
     parser.add_argument("--slippage-ticks", type=int, default=1)
-    parser.add_argument("--same-candle-policy", choices=("conservative", "optimistic"), default="conservative")
+    parser.add_argument(
+        "--same-candle-policy",
+        choices=("conservative", "optimistic"),
+        default="conservative",
+    )
     parser.add_argument("--request-sleep", type=float, default=0.12)
-    parser.add_argument("--output-prefix", default="v7_variants")
+    parser.add_argument("--output-prefix", default="v8_robust")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    if args.days <= 0:
-        raise SystemExit("--days must be greater than zero.")
+    if args.window_days <= 0:
+        raise SystemExit("--window-days must be greater than zero.")
+    if args.window_count <= 0:
+        raise SystemExit("--window-count must be greater than zero.")
     if args.rr < 3.0:
         raise SystemExit("This test requires RR >= 3.0.")
 
+    total_days = args.window_days * args.window_count
     cfg = StrategyConfig(
-        days=args.days,
+        days=total_days,
         warmup_days=args.warmup_days,
         reward_risk=args.rr,
         commission_percent=args.commission_percent,
@@ -1661,8 +1831,10 @@ def main() -> None:
         raise SystemExit("No symbols selected.")
 
     now = int(time.time())
-    end_time = (now // 60) * 60 - 60
-    start_time = end_time - cfg.days * 24 * 60 * 60
+    last_bar_time = (now // 60) * 60 - 60
+    end_exclusive = last_bar_time + 60
+    windows = build_test_windows(end_exclusive, args.window_days, args.window_count)
+    start_time = int(windows[0]["start_time"])
 
     all_trades: List[Dict[str, Any]] = []
     all_open: List[Dict[str, Any]] = []
@@ -1670,31 +1842,58 @@ def main() -> None:
     scan_errors: List[Dict[str, Any]] = []
 
     for position, symbol in enumerate(symbols, start=1):
-        print(f"[{position}/{len(symbols)}] preparing {symbol} once for {len(variants)} variants...")
+        print(
+            f"[{position}/{len(symbols)}] preparing {symbol} once for "
+            f"{len(variants)} variants x {len(windows)} windows..."
+        )
         meta = meta_map.get(symbol)
         success = False
         for attempt in range(1, 4):
             try:
-                simulation = prepare_symbol_data(client, symbol, cfg, start_time, end_time)
+                prepared = prepare_symbol_data(client, symbol, cfg, start_time, last_bar_time)
                 price_tick = meta.price_unit if meta and meta.price_unit else None
                 if price_tick is None or price_tick <= 0:
                     price_scale = meta.price_scale if meta and meta.price_scale is not None else 8
                     price_tick = 10.0 ** (-price_scale)
 
-                for variant in variants:
-                    trades, reject_counts, open_rows = simulate_variant(
-                        symbol, simulation, cfg, variant, price_tick
-                    )
-                    all_trades.extend(trades)
-                    all_open.extend(open_rows)
-                    for (direction, reason), count in reject_counts.items():
-                        rejection_rows.append({
-                            "variant": variant.name,
+                for window in windows:
+                    simulation = prepared.loc[
+                        (prepared["time"] >= int(window["start_time"]))
+                        & (prepared["time"] < int(window["end_time"]))
+                    ].copy()
+                    if simulation.empty:
+                        scan_errors.append({
                             "ticker": symbol,
-                            "direction": direction,
-                            "rejection_reason": reason,
-                            "count": int(count),
+                            "window": window["window"],
+                            "error": "no prepared rows in window",
                         })
+                        continue
+
+                    for variant in variants:
+                        trades, reject_counts, open_rows = simulate_variant(
+                            symbol, simulation, cfg, variant, float(price_tick)
+                        )
+                        for trade in trades:
+                            trade["window"] = window["window"]
+                            trade["window_start_utc"] = window["start_time_utc"]
+                            trade["window_end_utc"] = window["end_time_utc"]
+                        for open_row in open_rows:
+                            open_row["window"] = window["window"]
+                            open_row["window_start_utc"] = window["start_time_utc"]
+                            open_row["window_end_utc"] = window["end_time_utc"]
+                        all_trades.extend(trades)
+                        all_open.extend(open_rows)
+
+                        for (direction, reason), count in reject_counts.items():
+                            rejection_rows.append({
+                                "variant": variant.name,
+                                "is_primary_candidate": variant.name == PRIMARY_VARIANT_NAME,
+                                "window": window["window"],
+                                "ticker": symbol,
+                                "direction": direction,
+                                "rejection_reason": reason,
+                                "count": int(count),
+                            })
                 success = True
                 break
             except Exception as exc:
@@ -1702,57 +1901,114 @@ def main() -> None:
                 if attempt < 3:
                     time.sleep(3 * attempt)
         if not success:
-            scan_errors.append({"ticker": symbol, "error": "failed after 3 attempts"})
+            scan_errors.append({
+                "ticker": symbol,
+                "window": "ALL",
+                "error": "failed after 3 attempts",
+            })
 
     trades_frame = pd.DataFrame(all_trades)
-    period_rows = period_summary_rows(trades_frame, variants, start_time, end_time)
-    period_frame = pd.DataFrame(period_rows)
-    scorecard = build_scorecard(period_frame)
-    ticker_rows = ticker_summary_rows(trades_frame, variants, symbols)
+    if trades_frame.empty:
+        trades_frame = pd.DataFrame(columns=[
+            "variant", "window", "ticker", "direction", "entry_time_utc",
+            "exit_time_utc", "exit_reason", "pnl_r_net", "mfe_r", "mae_r",
+            "duration_minutes",
+        ])
+    summary_rows = window_summary_rows(trades_frame, variants, windows)
+    summary_frame = pd.DataFrame(summary_rows)
+    scorecard = build_robust_scorecard(summary_frame, windows)
+    ticker_rows = ticker_summary_rows(trades_frame, variants, symbols, windows)
+    leave_one_rows = leave_one_ticker_out_rows(trades_frame, symbols, windows)
     eq_rows = equity_rows(trades_frame)
 
     prefix_name = args.output_prefix
     outputs = {
         "trades": Path(f"{prefix_name}_trades.csv"),
-        "period_summary": Path(f"{prefix_name}_period_summary.csv"),
+        "window_summary": Path(f"{prefix_name}_window_summary.csv"),
         "scorecard": Path(f"{prefix_name}_scorecard.csv"),
         "ticker_summary": Path(f"{prefix_name}_ticker_summary.csv"),
         "rejections": Path(f"{prefix_name}_rejections.csv"),
         "equity": Path(f"{prefix_name}_equity.csv"),
         "open": Path(f"{prefix_name}_open.csv"),
+        "primary_leave_one_ticker_out": Path(f"{prefix_name}_primary_leave_one_ticker_out.csv"),
         "errors": Path(f"{prefix_name}_errors.csv"),
         "config": Path(f"{prefix_name}_config.json"),
     }
 
-    csv_or_empty(all_trades, ["variant", "ticker", "direction", "entry_time_utc", "exit_time_utc"], outputs["trades"])
-    period_frame.to_csv(outputs["period_summary"], index=False)
+    csv_or_empty(
+        all_trades,
+        ["variant", "window", "ticker", "direction", "entry_time_utc", "exit_time_utc"],
+        outputs["trades"],
+    )
+    summary_frame.to_csv(outputs["window_summary"], index=False)
     scorecard.to_csv(outputs["scorecard"], index=False)
     pd.DataFrame(ticker_rows).to_csv(outputs["ticker_summary"], index=False)
-    csv_or_empty(rejection_rows, ["variant", "ticker", "direction", "rejection_reason", "count"], outputs["rejections"])
-    csv_or_empty(eq_rows, ["variant", "exit_time_utc", "ticker", "pnl_r_net", "cumulative_r", "drawdown_r"], outputs["equity"])
-    csv_or_empty(all_open, ["variant", "ticker", "direction", "entry_time_utc"], outputs["open"])
-    csv_or_empty(scan_errors, ["ticker", "error"], outputs["errors"])
+    csv_or_empty(
+        rejection_rows,
+        ["variant", "window", "ticker", "direction", "rejection_reason", "count"],
+        outputs["rejections"],
+    )
+    csv_or_empty(
+        eq_rows,
+        ["variant", "window", "exit_time_utc", "ticker", "pnl_r_net", "cumulative_r", "drawdown_r"],
+        outputs["equity"],
+    )
+    csv_or_empty(
+        all_open,
+        ["variant", "window", "ticker", "direction", "entry_time_utc"],
+        outputs["open"],
+    )
+    pd.DataFrame(leave_one_rows).to_csv(outputs["primary_leave_one_ticker_out"], index=False)
+    csv_or_empty(scan_errors, ["ticker", "window", "error"], outputs["errors"])
 
     config_payload = {
-        "scanner_version": "MTF Pullback Quality v7 multi-variant",
+        "scanner_version": "MTF Pullback Quality v8 robust multi-window",
+        "primary_variant": PRIMARY_VARIANT_NAME,
         "strategy_config": asdict(cfg),
-        "variants": [asdict(v) for v in variants],
+        "window_days": args.window_days,
+        "window_count": args.window_count,
+        "windows": [
+            {
+                "window": window["window"],
+                "start_time_utc": window["start_time_utc"].isoformat(),
+                "end_time_utc": window["end_time_utc"].isoformat(),
+            }
+            for window in windows
+        ],
+        "variants": [asdict(variant) for variant in variants],
         "symbols": symbols,
-        "start_time_utc": pd.to_datetime(start_time, unit="s", utc=True).isoformat(),
-        "end_time_utc": pd.to_datetime(end_time, unit="s", utc=True).isoformat(),
         "same_candle_policy": args.same_candle_policy,
-        "notes": "Protection stops become active on the next M1 bar after trigger; conservative intrabar assumption.",
+        "notes": (
+            "Each window is simulated independently with reset position/cooldown/pullback state. "
+            "Indicators are prepared from a shared history with warmup. Protection stops become "
+            "active on the next M1 bar after trigger."
+        ),
     }
-    outputs["config"].write_text(json.dumps(config_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    outputs["config"].write_text(
+        json.dumps(config_payload, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
-    print("\n=== SCORECARD: ALL scope ===")
+    print("\n=== PRIMARY CANDIDATE ===")
+    primary_rows = scorecard.loc[
+        (scorecard["variant"] == PRIMARY_VARIANT_NAME)
+        & (scorecard["scope"].isin(["ALL", "LONG", "SHORT"]))
+    ]
+    primary_columns = [
+        "variant", "scope", "total_trades", "total_tp", "total_sl", "total_pf",
+        "total_expectancy_r", "total_net_r", "positive_windows", "all_windows_positive",
+        "worst_window_net_r", "decision", "robust_score",
+    ]
+    print(primary_rows[primary_columns].to_string(index=False) if not primary_rows.empty else "No primary trades.")
+
+    print("\n=== ALL VARIANTS / ALL SCOPE ===")
     if scorecard.empty:
         print("No closed trades.")
     else:
         columns = [
-            "variant", "full_trades", "full_tp", "full_sl", "full_be", "full_lock",
-            "full_pf", "full_expectancy_r", "full_net_r", "first_expectancy_r",
-            "second_expectancy_r", "both_halves_positive", "robust_score"
+            "variant", "total_trades", "total_tp", "total_sl", "total_be", "total_lock",
+            "total_pf", "total_expectancy_r", "total_net_r", "positive_windows",
+            "all_windows_positive", "worst_window_net_r", "decision", "robust_score",
         ]
         print(scorecard.loc[scorecard["scope"] == "ALL", columns].to_string(index=False))
 
