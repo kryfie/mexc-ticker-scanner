@@ -84,6 +84,22 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Check repository files
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -lah
+
+          test -f mtf_regime_diagnostic.py || {
+            echo "::error::Brakuje mtf_regime_diagnostic.py w głównym katalogu repozytorium."
+            exit 1
+          }
+
+          test -f requirements.txt || {
+            echo "::error::Brakuje requirements.txt w głównym katalogu repozytorium."
+            exit 1
+          }
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -93,6 +109,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Validate Python syntax
+        run: |
+          python -m py_compile mtf_regime_diagnostic.py
 
       - name: Run exact Pine v6 3R scanner
         shell: bash
@@ -163,7 +183,7 @@ jobs:
             ARGS+=(--no-regime-exit)
           fi
 
-         python -u mtf_regime_diagnostic.py "${ARGS[@]}"
+          python -u mtf_regime_diagnostic.py "${ARGS[@]}"
 
       - name: Validate outputs
         run: |
