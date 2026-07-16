@@ -1,4 +1,4 @@
-name: MTF Regime Fixed Tickers
+name: MTF Pullback Quality v6 3R — 30D
 
 on:
   workflow_dispatch:
@@ -9,8 +9,8 @@ jobs:
     timeout-minutes: 360
 
     # ============================================================
-    # TUTAJ ZMIENIAJ TICKERY I PARAMETRY TESTU
-    # Symbole MEXC zapisujemy jako NAZWA_USDT.
+    # EDYTUJ TEN BLOK, GDY CHCESZ ZMIENIĆ TICKERY LUB PARAMETRY.
+    # BEAT_USDT celowo pominięty.
     # ============================================================
     env:
       SYMBOLS: >-
@@ -24,7 +24,6 @@ jobs:
         IOTA_USDT
         PYTH_USDT
         FOLKS_USDT
-        BEAT_USDT
         AGT_USDT
         RIF_USDT
         RESOLV_USDT
@@ -39,26 +38,47 @@ jobs:
         OPENAI_USDT
 
       DAYS: "30"
-      RR: "2.0"
+      RR: "3.0"
       COMMISSION_PERCENT: "0.06"
       SLIPPAGE_TICKS: "1"
       SAME_CANDLE_POLICY: "conservative"
 
-      # true  = zamknięcie po utracie reżimu M15
-      # false = wyłącznie SL albo TP
-      EXIT_ON_REGIME_LOSS: "true"
+      ALLOW_LONG: "true"
+      ALLOW_SHORT: "true"
+      EXIT_ON_REGIME_LOSS: "false"
 
-      # Dodatkowe parametry strategii
-      MIN_REGIME_STRENGTH: "68.0"
-      MIN_REGIME_ER: "0.20"
+      MIN_REGIME_ER: "0.22"
       MIN_REGIME_SLOPE_ATR: "0.08"
+      MAX_REGIME_SLOPE_ATR: "0.80"
+      MIN_REGIME_STRETCH_ATR: "0.00"
       MAX_REGIME_STRETCH_ATR: "2.50"
-      PULLBACK_VALID_BARS: "4"
-      MIN_RANGE_EXPANSION: "1.10"
-      MIN_BODY_RATIO: "0.55"
-      MAX_ENTRY_STRETCH_ATR: "0.80"
-      MIN_STOP_ATR: "0.25"
-      MAX_STOP_ATR: "2.00"
+      MIN_REGIME_STRENGTH: "60.0"
+      MAX_REGIME_AGE_BARS: "20"
+
+      PULLBACK_VALID_BARS: "3"
+      ZONE_BUFFER_ATR: "0.15"
+      MAX_MID_OVERSHOOT_ATR: "0.25"
+      MIN_PULLBACK_ATR_RATIO: "0.60"
+      MAX_PULLBACK_ATR_RATIO: "1.00"
+
+      MICRO_TOUCH_LOOKBACK: "3"
+      BREAKOUT_LOOKBACK: "2"
+      MIN_RANGE_RATIO: "0.80"
+      MAX_RANGE_RATIO: "1.60"
+      MIN_BODY_RATIO: "0.45"
+      MAX_BODY_RATIO: "0.85"
+      MIN_CLOSE_LOCATION: "0.70"
+      MAX_ENTRY_STRETCH_ATR: "0.50"
+
+      M5_SWING_LOOKBACK: "10"
+      STOP_BUFFER_M5_ATR: "0.10"
+      MIN_STOP_ATR: "0.75"
+      MAX_STOP_ATR: "2.50"
+      MIN_STOP_PCT: "0.50"
+      MAX_STOP_PCT: "3.00"
+      MIN_TARGET_PCT: "1.50"
+      MAX_TARGET_PCT: "9.00"
+      COOLDOWN_BARS: "10"
 
     steps:
       - name: Checkout repository
@@ -74,11 +94,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run fixed-ticker MTF scanner
+      - name: Run exact Pine v6 3R scanner
         shell: bash
         run: |
           set -euo pipefail
-
           read -r -a SYMBOL_ARRAY <<< "$SYMBOLS"
 
           ARGS=(
@@ -89,87 +108,117 @@ jobs:
             --commission-percent "$COMMISSION_PERCENT"
             --slippage-ticks "$SLIPPAGE_TICKS"
             --same-candle-policy "$SAME_CANDLE_POLICY"
-            --min-regime-strength "$MIN_REGIME_STRENGTH"
+
             --min-regime-er "$MIN_REGIME_ER"
             --min-regime-slope-atr "$MIN_REGIME_SLOPE_ATR"
+            --max-regime-slope-atr "$MAX_REGIME_SLOPE_ATR"
+            --min-regime-stretch-atr "$MIN_REGIME_STRETCH_ATR"
             --max-regime-stretch-atr "$MAX_REGIME_STRETCH_ATR"
+            --min-regime-strength "$MIN_REGIME_STRENGTH"
+            --max-regime-age-bars "$MAX_REGIME_AGE_BARS"
+
             --pullback-valid-bars "$PULLBACK_VALID_BARS"
-            --min-range-expansion "$MIN_RANGE_EXPANSION"
+            --zone-buffer-atr "$ZONE_BUFFER_ATR"
+            --max-mid-overshoot-atr "$MAX_MID_OVERSHOOT_ATR"
+            --min-pullback-atr-ratio "$MIN_PULLBACK_ATR_RATIO"
+            --max-pullback-atr-ratio "$MAX_PULLBACK_ATR_RATIO"
+
+            --micro-touch-lookback "$MICRO_TOUCH_LOOKBACK"
+            --breakout-lookback "$BREAKOUT_LOOKBACK"
+            --min-range-ratio "$MIN_RANGE_RATIO"
+            --max-range-ratio "$MAX_RANGE_RATIO"
             --min-body-ratio "$MIN_BODY_RATIO"
+            --max-body-ratio "$MAX_BODY_RATIO"
+            --min-close-location "$MIN_CLOSE_LOCATION"
             --max-entry-stretch-atr "$MAX_ENTRY_STRETCH_ATR"
+
+            --m5-swing-lookback "$M5_SWING_LOOKBACK"
+            --stop-buffer-m5-atr "$STOP_BUFFER_M5_ATR"
             --min-stop-atr "$MIN_STOP_ATR"
             --max-stop-atr "$MAX_STOP_ATR"
-            --ranking-output ranking_mtf.csv
-            --trades-output trades_mtf.csv
-            --rejected-output rejected_setups.csv
-            --equity-output equity_curve_mtf.csv
-            --open-output open_trades_mtf.csv
-            --config-output run_config.json
+            --min-stop-pct "$MIN_STOP_PCT"
+            --max-stop-pct "$MAX_STOP_PCT"
+            --min-target-pct "$MIN_TARGET_PCT"
+            --max-target-pct "$MAX_TARGET_PCT"
+            --cooldown-bars "$COOLDOWN_BARS"
+
+            --ranking-output ranking_v6_3r.csv
+            --trades-output trades_v6_3r.csv
+            --rejected-output rejected_v6_3r.csv
+            --equity-output equity_v6_3r.csv
+            --open-output open_v6_3r.csv
+            --summary-output summary_v6_3r.csv
+            --config-output run_config_v6_3r.json
           )
 
+          if [[ "$ALLOW_LONG" == "false" ]]; then
+            ARGS+=(--no-long)
+          fi
+          if [[ "$ALLOW_SHORT" == "false" ]]; then
+            ARGS+=(--no-short)
+          fi
           if [[ "$EXIT_ON_REGIME_LOSS" == "true" ]]; then
             ARGS+=(--exit-on-regime-loss)
           else
             ARGS+=(--no-regime-exit)
           fi
 
-          echo "Scanning symbols:"
-          printf '  %s\n' "${SYMBOL_ARRAY[@]}"
+          python -u mtf_pullback_quality_v6_3r_scanner.py "${ARGS[@]}"
 
-          python -u mtf_regime_diagnostic.py "${ARGS[@]}"
-
-      - name: Validate generated files
+      - name: Validate outputs
         run: |
           set -e
-          test -s ranking_mtf.csv
-          test -s trades_mtf.csv
-          test -s rejected_setups.csv
-          test -s equity_curve_mtf.csv
-          test -s open_trades_mtf.csv
-          test -s run_config.json
+          for file in \
+            ranking_v6_3r.csv \
+            trades_v6_3r.csv \
+            rejected_v6_3r.csv \
+            equity_v6_3r.csv \
+            open_v6_3r.csv \
+            summary_v6_3r.csv \
+            run_config_v6_3r.json
+          do
+            test -s "$file"
+          done
 
-          echo "==== ranking_mtf.csv ===="
-          head -30 ranking_mtf.csv
+          echo "==== COMBINED SUMMARY ===="
+          cat summary_v6_3r.csv
 
-          echo "==== trades_mtf.csv ===="
-          head -10 trades_mtf.csv
+          echo "==== TOP TICKERS ===="
+          head -25 ranking_v6_3r.csv
 
       - name: Add run summary
         if: always()
         shell: bash
         run: |
           {
-            echo "## MTF Regime — fixed ticker test"
+            echo "## Pine v6 3R — 30-day MEXC backtest"
             echo ""
             echo "- Days: \`$DAYS\`"
             echo "- RR: \`$RR\`"
+            echo "- LONG: \`$ALLOW_LONG\`"
+            echo "- SHORT: \`$ALLOW_SHORT\`"
             echo "- Regime exit: \`$EXIT_ON_REGIME_LOSS\`"
-            echo "- Same-candle policy: \`$SAME_CANDLE_POLICY\`"
             echo ""
-            echo "### Tickers"
-            echo '```text'
-            printf '%s\n' $SYMBOLS
-            echo '```'
-            echo ""
-            if [[ -f ranking_mtf.csv ]]; then
-              echo "### Ranking"
+            if [[ -f summary_v6_3r.csv ]]; then
+              echo "### Combined summary"
               echo '```csv'
-              head -25 ranking_mtf.csv
+              cat summary_v6_3r.csv
               echo '```'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload scanner outputs
+      - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mtf-fixed-tickers-${{ github.run_id }}
+          name: mtf-v6-3r-30d-${{ github.run_id }}
           retention-days: 30
           if-no-files-found: error
           path: |
-            ranking_mtf.csv
-            trades_mtf.csv
-            rejected_setups.csv
-            equity_curve_mtf.csv
-            open_trades_mtf.csv
-            run_config.json
+            ranking_v6_3r.csv
+            trades_v6_3r.csv
+            rejected_v6_3r.csv
+            equity_v6_3r.csv
+            open_v6_3r.csv
+            summary_v6_3r.csv
+            run_config_v6_3r.json
