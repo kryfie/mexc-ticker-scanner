@@ -1,0 +1,181 @@
+name: MTF Regime Diagnostic Scanner
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbols:
+        description: "Tickery oddzielone spacją, np. ETH_USDT SUI_USDT. Puste = skanuj wszystkie."
+        required: false
+        default: ""
+        type: string
+      days:
+        description: "Liczba dni backtestu"
+        required: true
+        default: "30"
+        type: string
+      limit:
+        description: "Limit tickerów przy skanowaniu wszystkich. 0 = bez limitu."
+        required: true
+        default: "50"
+        type: string
+      rr:
+        description: "Take Profit w R"
+        required: true
+        default: "2.0"
+        type: string
+      exit_on_regime_loss:
+        description: "Zamykaj po utracie reżimu M15"
+        required: true
+        default: true
+        type: boolean
+      same_candle_policy:
+        description: "Gdy SL i TP są trafione w tej samej świecy"
+        required: true
+        default: conservative
+        type: choice
+        options:
+          - conservative
+          - optimistic
+      min_max_leverage:
+        description: "Minimalny maksymalny lewar kontraktu. 0 = bez filtra."
+        required: true
+        default: "0"
+        type: string
+
+  schedule:
+    - cron: "0 6 * * 1"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      SYMBOLS: ${{ inputs.symbols || '' }}
+      DAYS: ${{ inputs.days || '30' }}
+      LIMIT: ${{ inputs.limit || '50' }}
+      RR: ${{ inputs.rr || '2.0' }}
+      EXIT_ON_REGIME_LOSS: ${{ inputs.exit_on_regime_loss || false }}
+      SAME_CANDLE_POLICY: ${{ inputs.same_candle_policy || 'conservative' }}
+      MIN_MAX_LEVERAGE: ${{ inputs.min_max_leverage || '0' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy requests
+
+      - name: Run MTF diagnostic scanner
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARGS=(
+            --days "$DAYS"
+            --warmup-days 7
+            --rr "$RR"
+            --commission-percent 0.06
+            --slippage-ticks 1
+            --same-candle-policy "$SAME_CANDLE_POLICY"
+            --ranking-output ranking_mtf.csv
+            --trades-output trades_mtf.csv
+            --rejected-output rejected_setups.csv
+            --equity-output equity_curve_mtf.csv
+            --open-output open_trades_mtf.csv
+            --config-output run_config.json
+          )
+
+          if [[ "$EXIT_ON_REGIME_LOSS" == "true" ]]; then
+            ARGS+=(--exit-on-regime-loss)
+          else
+            ARGS+=(--no-regime-exit)
+          fi
+
+          if [[ -n "${SYMBOLS// }" ]]; then
+            read -r -a SYMBOL_ARRAY <<< "$SYMBOLS"
+            ARGS+=(--symbols "${SYMBOL_ARRAY[@]}")
+          else
+            ARGS+=(--all)
+
+            if [[ "$LIMIT" =~ ^[0-9]+$ ]] && (( LIMIT > 0 )); then
+              ARGS+=(--limit "$LIMIT")
+            fi
+          fi
+
+          if [[ "$MIN_MAX_LEVERAGE" =~ ^[0-9]+$ ]] && (( MIN_MAX_LEVERAGE > 0 )); then
+            ARGS+=(--min-max-leverage "$MIN_MAX_LEVERAGE")
+          fi
+
+          python -u mtf_regime_diagnostic.py "${ARGS[@]}"
+
+      - name: Validate generated files
+        run: |
+          set -e
+          ls -lah
+          test -s ranking_mtf.csv
+          test -s trades_mtf.csv
+          test -s rejected_setups.csv
+          test -s equity_curve_mtf.csv
+          test -s open_trades_mtf.csv
+          test -s run_config.json
+
+          echo "==== ranking_mtf.csv ===="
+          head -30 ranking_mtf.csv
+
+          echo "==== trades_mtf.csv ===="
+          head -10 trades_mtf.csv
+
+          echo "==== most common rejection reasons ===="
+          python - <<'PY'
+          import pandas as pd
+
+          path = "rejected_setups.csv"
+          df = pd.read_csv(path)
+          if df.empty or "rejection_reason" not in df.columns:
+              print("No rejected setups.")
+          else:
+              print(df["rejection_reason"].value_counts().head(20).to_string())
+          PY
+
+      - name: Add run summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## MTF Regime Diagnostic Scanner"
+            echo ""
+            echo "- Days: \`$DAYS\`"
+            echo "- RR: \`$RR\`"
+            echo "- Regime exit: \`$EXIT_ON_REGIME_LOSS\`"
+            echo "- Same-candle policy: \`$SAME_CANDLE_POLICY\`"
+            echo ""
+            if [[ -f ranking_mtf.csv ]]; then
+              echo "### Top ranking rows"
+              echo '```csv'
+              head -15 ranking_mtf.csv
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload scanner outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mtf-regime-diagnostic-${{ github.run_id }}
+          retention-days: 30
+          if-no-files-found: error
+          path: |
+            ranking_mtf.csv
+            trades_mtf.csv
+            rejected_setups.csv
+            equity_curve_mtf.csv
+            open_trades_mtf.csv
+            run_config.json
