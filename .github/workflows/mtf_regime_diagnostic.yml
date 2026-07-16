@@ -163,7 +163,7 @@ jobs:
             ARGS+=(--no-regime-exit)
           fi
 
-          python -u mtf_pullback_quality_v6_3r_scanner.py "${ARGS[@]}"
+         python -u mtf_regime_diagnostic.py "${ARGS[@]}"
 
       - name: Validate outputs
         run: |
