@@ -1,63 +1,64 @@
-name: MTF Regime Diagnostic Scanner
+name: MTF Regime Fixed Tickers
 
 on:
   workflow_dispatch:
-    inputs:
-      symbols:
-        description: "Tickery oddzielone spacją, np. ETH_USDT SUI_USDT. Puste = skanuj wszystkie."
-        required: false
-        default: ""
-        type: string
-      days:
-        description: "Liczba dni backtestu"
-        required: true
-        default: "30"
-        type: string
-      limit:
-        description: "Limit tickerów przy skanowaniu wszystkich. 0 = bez limitu."
-        required: true
-        default: "50"
-        type: string
-      rr:
-        description: "Take Profit w R"
-        required: true
-        default: "2.0"
-        type: string
-      exit_on_regime_loss:
-        description: "Zamykaj po utracie reżimu M15"
-        required: true
-        default: true
-        type: boolean
-      same_candle_policy:
-        description: "Gdy SL i TP są trafione w tej samej świecy"
-        required: true
-        default: conservative
-        type: choice
-        options:
-          - conservative
-          - optimistic
-      min_max_leverage:
-        description: "Minimalny maksymalny lewar kontraktu. 0 = bez filtra."
-        required: true
-        default: "0"
-        type: string
-
-  schedule:
-    - cron: "0 6 * * 1"
 
 jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
+    # ============================================================
+    # TUTAJ ZMIENIAJ TICKERY I PARAMETRY TESTU
+    # Symbole MEXC zapisujemy jako NAZWA_USDT.
+    # ============================================================
     env:
-      SYMBOLS: ${{ inputs.symbols || '' }}
-      DAYS: ${{ inputs.days || '30' }}
-      LIMIT: ${{ inputs.limit || '50' }}
-      RR: ${{ inputs.rr || '2.0' }}
-      EXIT_ON_REGIME_LOSS: ${{ inputs.exit_on_regime_loss || false }}
-      SAME_CANDLE_POLICY: ${{ inputs.same_candle_policy || 'conservative' }}
-      MIN_MAX_LEVERAGE: ${{ inputs.min_max_leverage || '0' }}
+      SYMBOLS: >-
+        BTC_USDT
+        ETH_USDT
+        SPX_USDT
+        SOL_USDT
+        SUI_USDT
+        BRETT_USDT
+        RENDER_USDT
+        IOTA_USDT
+        PYTH_USDT
+        FOLKS_USDT
+        BEAT_USDT
+        AGT_USDT
+        RIF_USDT
+        RESOLV_USDT
+        EGLD_USDT
+        FLOCK_USDT
+        BCH_USDT
+        VELVET_USDT
+        M_USDT
+        SKYAI_USDT
+        POL_USDT
+        VTHO_USDT
+        OPENAI_USDT
+
+      DAYS: "30"
+      RR: "2.0"
+      COMMISSION_PERCENT: "0.06"
+      SLIPPAGE_TICKS: "1"
+      SAME_CANDLE_POLICY: "conservative"
+
+      # true  = zamknięcie po utracie reżimu M15
+      # false = wyłącznie SL albo TP
+      EXIT_ON_REGIME_LOSS: "true"
+
+      # Dodatkowe parametry strategii
+      MIN_REGIME_STRENGTH: "68.0"
+      MIN_REGIME_ER: "0.20"
+      MIN_REGIME_SLOPE_ATR: "0.08"
+      MAX_REGIME_STRETCH_ATR: "2.50"
+      PULLBACK_VALID_BARS: "4"
+      MIN_RANGE_EXPANSION: "1.10"
+      MIN_BODY_RATIO: "0.55"
+      MAX_ENTRY_STRETCH_ATR: "0.80"
+      MIN_STOP_ATR: "0.25"
+      MAX_STOP_ATR: "2.00"
 
     steps:
       - name: Checkout repository
@@ -73,18 +74,31 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run MTF diagnostic scanner
+      - name: Run fixed-ticker MTF scanner
         shell: bash
         run: |
           set -euo pipefail
 
+          read -r -a SYMBOL_ARRAY <<< "$SYMBOLS"
+
           ARGS=(
+            --symbols "${SYMBOL_ARRAY[@]}"
             --days "$DAYS"
             --warmup-days 7
             --rr "$RR"
-            --commission-percent 0.06
-            --slippage-ticks 1
+            --commission-percent "$COMMISSION_PERCENT"
+            --slippage-ticks "$SLIPPAGE_TICKS"
             --same-candle-policy "$SAME_CANDLE_POLICY"
+            --min-regime-strength "$MIN_REGIME_STRENGTH"
+            --min-regime-er "$MIN_REGIME_ER"
+            --min-regime-slope-atr "$MIN_REGIME_SLOPE_ATR"
+            --max-regime-stretch-atr "$MAX_REGIME_STRETCH_ATR"
+            --pullback-valid-bars "$PULLBACK_VALID_BARS"
+            --min-range-expansion "$MIN_RANGE_EXPANSION"
+            --min-body-ratio "$MIN_BODY_RATIO"
+            --max-entry-stretch-atr "$MAX_ENTRY_STRETCH_ATR"
+            --min-stop-atr "$MIN_STOP_ATR"
+            --max-stop-atr "$MAX_STOP_ATR"
             --ranking-output ranking_mtf.csv
             --trades-output trades_mtf.csv
             --rejected-output rejected_setups.csv
@@ -99,27 +113,14 @@ jobs:
             ARGS+=(--no-regime-exit)
           fi
 
-          if [[ -n "${SYMBOLS// }" ]]; then
-            read -r -a SYMBOL_ARRAY <<< "$SYMBOLS"
-            ARGS+=(--symbols "${SYMBOL_ARRAY[@]}")
-          else
-            ARGS+=(--all)
-
-            if [[ "$LIMIT" =~ ^[0-9]+$ ]] && (( LIMIT > 0 )); then
-              ARGS+=(--limit "$LIMIT")
-            fi
-          fi
-
-          if [[ "$MIN_MAX_LEVERAGE" =~ ^[0-9]+$ ]] && (( MIN_MAX_LEVERAGE > 0 )); then
-            ARGS+=(--min-max-leverage "$MIN_MAX_LEVERAGE")
-          fi
+          echo "Scanning symbols:"
+          printf '  %s\n' "${SYMBOL_ARRAY[@]}"
 
           python -u mtf_regime_diagnostic.py "${ARGS[@]}"
 
       - name: Validate generated files
         run: |
           set -e
-          ls -lah
           test -s ranking_mtf.csv
           test -s trades_mtf.csv
           test -s rejected_setups.csv
@@ -133,34 +134,27 @@ jobs:
           echo "==== trades_mtf.csv ===="
           head -10 trades_mtf.csv
 
-          echo "==== most common rejection reasons ===="
-          python - <<'PY'
-          import pandas as pd
-
-          path = "rejected_setups.csv"
-          df = pd.read_csv(path)
-          if df.empty or "rejection_reason" not in df.columns:
-              print("No rejected setups.")
-          else:
-              print(df["rejection_reason"].value_counts().head(20).to_string())
-          PY
-
       - name: Add run summary
         if: always()
         shell: bash
         run: |
           {
-            echo "## MTF Regime Diagnostic Scanner"
+            echo "## MTF Regime — fixed ticker test"
             echo ""
             echo "- Days: \`$DAYS\`"
             echo "- RR: \`$RR\`"
             echo "- Regime exit: \`$EXIT_ON_REGIME_LOSS\`"
             echo "- Same-candle policy: \`$SAME_CANDLE_POLICY\`"
             echo ""
+            echo "### Tickers"
+            echo '```text'
+            printf '%s\n' $SYMBOLS
+            echo '```'
+            echo ""
             if [[ -f ranking_mtf.csv ]]; then
-              echo "### Top ranking rows"
+              echo "### Ranking"
               echo '```csv'
-              head -15 ranking_mtf.csv
+              head -25 ranking_mtf.csv
               echo '```'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
@@ -169,7 +163,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mtf-regime-diagnostic-${{ github.run_id }}
+          name: mtf-fixed-tickers-${{ github.run_id }}
           retention-days: 30
           if-no-files-found: error
           path: |
