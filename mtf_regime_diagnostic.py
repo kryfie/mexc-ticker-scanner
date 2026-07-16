@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-MTF Regime Diagnostic Scanner for MEXC USDT-M perpetual futures.
+MTF Pullback Quality v6 3R Scanner for MEXC USDT-M perpetual futures.
 
-Model replicated from the Pine strategy:
-    M15 -> trend regime
-    M5  -> pullback
-    M1  -> breakout trigger
-    SL  -> M5 swing + ATR buffer
-    TP  -> fixed R multiple
+Exact model replicated from Pine: MTF Pullback Quality Strategy v6 — 3R.
+    M15 -> fresh directional regime with age/slope/stretch limits
+    M5  -> controlled pullback
+    M1  -> micro-touch + breakout quality trigger
+    SL  -> M5 swing, dynamically widened by ATR / price floor
+    TP  -> minimum 3R from simulated fill price
 
 Outputs:
     ranking_mtf.csv
@@ -68,51 +68,66 @@ class ContractMeta:
 class StrategyConfig:
     days: int = 30
     warmup_days: int = 7
-    reward_risk: float = 2.0
+    reward_risk: float = 3.0
     commission_percent: float = 0.06
     slippage_ticks: int = 1
     conservative_same_candle: bool = True
-    exit_on_regime_loss: bool = True
+    exit_on_regime_loss: bool = False
     cooldown_after_exit_bars: int = 10
+    one_trade_per_pullback: bool = True
+    allow_long: bool = True
+    allow_short: bool = True
 
-    # M15 regime
+    # M15 regime — Pine v6
     regime_fast_len: int = 50
     regime_slow_len: int = 200
     regime_atr_len: int = 14
     regime_slope_len: int = 6
     regime_er_len: int = 20
-    min_regime_er: float = 0.20
+    min_regime_er: float = 0.22
     min_regime_slope_atr: float = 0.08
+    max_regime_slope_atr: float = 0.80
+    min_regime_stretch_atr: float = 0.00
     max_regime_stretch_atr: float = 2.50
-    min_regime_strength: float = 68.0
+    min_regime_strength: float = 60.0
+    max_regime_age_bars: int = 20
 
-    # M5 pullback
+    # M5 controlled pullback — Pine v6
     pull_fast_len: int = 12
     pull_mid_len: int = 50
     pull_atr_len: int = 14
     pull_atr_avg_len: int = 20
-    pullback_valid_bars: int = 4
+    pullback_valid_bars: int = 3
     zone_buffer_atr: float = 0.15
-    max_mid_overshoot_atr: float = 0.35
-    max_pullback_atr_ratio: float = 1.05
+    max_mid_overshoot_atr: float = 0.25
+    min_pullback_atr_ratio: float = 0.60
+    max_pullback_atr_ratio: float = 1.00
     require_counter_candle: bool = True
     pullback_impulse_lookback: int = 12
 
-    # M1 trigger
+    # M1 quality trigger — Pine v6
     trigger_fast_len: int = 12
     trigger_mid_len: int = 50
     trigger_atr_len: int = 14
-    breakout_lookback: int = 3
+    micro_touch_lookback: int = 3
+    breakout_lookback: int = 2
     range_avg_len: int = 20
-    min_range_expansion: float = 1.10
-    min_body_ratio: float = 0.55
-    max_entry_stretch_atr: float = 0.80
+    min_range_ratio: float = 0.80
+    max_range_ratio: float = 1.60
+    min_body_ratio: float = 0.45
+    max_body_ratio: float = 0.85
+    min_close_location: float = 0.70
+    max_entry_stretch_atr: float = 0.50
 
-    # Risk
-    m5_swing_lookback: int = 6
+    # Risk / 3R target — Pine v6
+    m5_swing_lookback: int = 10
     stop_buffer_m5_atr: float = 0.10
-    min_stop_distance_m5_atr: float = 0.25
-    max_stop_distance_m5_atr: float = 2.00
+    min_stop_distance_m5_atr: float = 0.75
+    max_stop_distance_m5_atr: float = 2.50
+    min_stop_distance_pct: float = 0.50
+    max_stop_distance_pct: float = 3.00
+    min_target_distance_pct: float = 1.50
+    max_target_distance_pct: float = 9.00
 
 
 @dataclass
@@ -148,7 +163,7 @@ class MexcPublicClient:
         self.session = requests.Session()
         self.session.headers.update(
             {
-                "User-Agent": "mtf-regime-diagnostic-scanner/1.0",
+                "User-Agent": "mtf-pullback-quality-v6-scanner/1.0",
                 "Accept": "application/json",
             }
         )
@@ -537,46 +552,53 @@ def prepare_m15(frame: pd.DataFrame, cfg: StrategyConfig) -> pd.DataFrame:
     ) * 10.0
 
     output["m15_long_strength"] = (
-        long_alignment
-        + long_location
-        + long_fast_slope
-        + long_slow_slope
-        + efficiency_score
-        + stretch_score
+        long_alignment + long_location + long_fast_slope + long_slow_slope
+        + efficiency_score + stretch_score
     )
     output["m15_short_strength"] = (
-        short_alignment
-        + short_location
-        + short_fast_slope
-        + short_slow_slope
-        + efficiency_score
-        + stretch_score
+        short_alignment + short_location + short_fast_slope + short_slow_slope
+        + efficiency_score + stretch_score
     )
 
-    output["m15_long_regime"] = (
+    output["m15_long_base"] = (
         (output["m15_ema_fast"] > output["m15_ema_slow"])
         & (output["close"] > output["m15_ema_fast"])
         & (output["m15_slope_fast_atr"] >= cfg.min_regime_slope_atr)
+        & (output["m15_slope_fast_atr"] <= cfg.max_regime_slope_atr)
         & (output["m15_er"] >= cfg.min_regime_er)
+        & (output["m15_stretch_atr"] >= cfg.min_regime_stretch_atr)
         & (output["m15_stretch_atr"] <= cfg.max_regime_stretch_atr)
         & (output["m15_long_strength"] >= cfg.min_regime_strength)
     )
-    output["m15_short_regime"] = (
+    output["m15_short_base"] = (
         (output["m15_ema_fast"] < output["m15_ema_slow"])
         & (output["close"] < output["m15_ema_fast"])
         & (output["m15_slope_fast_atr"] <= -cfg.min_regime_slope_atr)
+        & (output["m15_slope_fast_atr"] >= -cfg.max_regime_slope_atr)
         & (output["m15_er"] >= cfg.min_regime_er)
+        & (output["m15_stretch_atr"] >= cfg.min_regime_stretch_atr)
         & (output["m15_stretch_atr"] <= cfg.max_regime_stretch_atr)
         & (output["m15_short_strength"] >= cfg.min_regime_strength)
     )
 
-    output["m15_long_regime_age"] = consecutive_true_count(output["m15_long_regime"])
-    output["m15_short_regime_age"] = consecutive_true_count(output["m15_short_regime"])
+    # Equivalent to Pine: ready ? ta.barssince(not ready) : 0.
+    output["m15_long_regime_age"] = consecutive_true_count(output["m15_long_base"])
+    output["m15_short_regime_age"] = consecutive_true_count(output["m15_short_base"])
+
+    output["m15_long_regime"] = (
+        output["m15_long_base"]
+        & output["m15_long_regime_age"].between(1, cfg.max_regime_age_bars)
+    )
+    output["m15_short_regime"] = (
+        output["m15_short_base"]
+        & output["m15_short_regime_age"].between(1, cfg.max_regime_age_bars)
+    )
+
     output["m15_long_move_since_start_atr"] = directional_move_since_start(
-        output["close"], output["m15_long_regime"], 1, output["m15_atr"]
+        output["close"], output["m15_long_base"], 1, output["m15_atr"]
     )
     output["m15_short_move_since_start_atr"] = directional_move_since_start(
-        output["close"], output["m15_short_regime"], -1, output["m15_atr"]
+        output["close"], output["m15_short_base"], -1, output["m15_atr"]
     )
     return output
 
@@ -594,18 +616,21 @@ def prepare_m5(frame: pd.DataFrame, cfg: StrategyConfig) -> pd.DataFrame:
     output["m5_volume_avg"] = output["vol"].rolling(
         cfg.pull_atr_avg_len, min_periods=cfg.pull_atr_avg_len
     ).mean()
+    output["m5_range_ratio"] = output["m5_atr"] / output["m5_atr_avg"]
 
     long_touch = (
         (output["m5_ema_fast"] > output["m5_ema_mid"])
         & (output["low"] <= output["m5_ema_fast"] + output["m5_atr"] * cfg.zone_buffer_atr)
         & (output["low"] >= output["m5_ema_mid"] - output["m5_atr"] * cfg.max_mid_overshoot_atr)
-        & (output["m5_atr"] <= output["m5_atr_avg"] * cfg.max_pullback_atr_ratio)
+        & (output["m5_range_ratio"] >= cfg.min_pullback_atr_ratio)
+        & (output["m5_range_ratio"] <= cfg.max_pullback_atr_ratio)
     )
     short_touch = (
         (output["m5_ema_fast"] < output["m5_ema_mid"])
         & (output["high"] >= output["m5_ema_fast"] - output["m5_atr"] * cfg.zone_buffer_atr)
         & (output["high"] <= output["m5_ema_mid"] + output["m5_atr"] * cfg.max_mid_overshoot_atr)
-        & (output["m5_atr"] <= output["m5_atr_avg"] * cfg.max_pullback_atr_ratio)
+        & (output["m5_range_ratio"] >= cfg.min_pullback_atr_ratio)
+        & (output["m5_range_ratio"] <= cfg.max_pullback_atr_ratio)
     )
 
     if cfg.require_counter_candle:
@@ -634,6 +659,10 @@ def prepare_m5(frame: pd.DataFrame, cfg: StrategyConfig) -> pd.DataFrame:
         )
     )
 
+    # Pine valuewhen(touch, time, 0).
+    output["m5_long_pullback_id"] = output["time"].where(long_touch).ffill()
+    output["m5_short_pullback_id"] = output["time"].where(short_touch).ffill()
+
     output["m5_swing_low"] = output["low"].rolling(
         cfg.m5_swing_lookback, min_periods=cfg.m5_swing_lookback
     ).min()
@@ -656,7 +685,6 @@ def prepare_m5(frame: pd.DataFrame, cfg: StrategyConfig) -> pd.DataFrame:
     output["m5_short_pullback_depth_pct"] = (
         (output["high"] - impulse_low) / impulse_low.replace(0.0, np.nan) * 100.0
     )
-    output["m5_range_ratio"] = output["m5_atr"] / output["m5_atr_avg"]
     output["m5_volume_ratio"] = output["vol"] / output["m5_volume_avg"]
     output["m5_distance_ema12_atr"] = (
         output["close"] - output["m5_ema_fast"]
@@ -681,6 +709,9 @@ def prepare_m1(frame: pd.DataFrame, cfg: StrategyConfig) -> pd.DataFrame:
 
     candle_range = (output["high"] - output["low"]).clip(lower=1e-12)
     output["m1_body_ratio"] = (output["close"] - output["open"]).abs() / candle_range
+    output["m1_close_location_long"] = (output["close"] - output["low"]) / candle_range
+    output["m1_close_location_short"] = (output["high"] - output["close"]) / candle_range
+
     output["m1_long_break_level"] = output["high"].shift(1).rolling(
         cfg.breakout_lookback, min_periods=cfg.breakout_lookback
     ).max()
@@ -705,24 +736,46 @@ def prepare_m1(frame: pd.DataFrame, cfg: StrategyConfig) -> pd.DataFrame:
         output["m1_short_break_level"] - output["close"]
     ) / output["m1_atr"]
 
+    long_touch = output["low"] <= output["m1_ema_fast"]
+    short_touch = output["high"] >= output["m1_ema_fast"]
+    output["m1_recent_long_touch"] = (
+        long_touch.shift(1).rolling(
+            cfg.micro_touch_lookback, min_periods=cfg.micro_touch_lookback
+        ).max().fillna(0.0) > 0.5
+    )
+    output["m1_recent_short_touch"] = (
+        short_touch.shift(1).rolling(
+            cfg.micro_touch_lookback, min_periods=cfg.micro_touch_lookback
+        ).max().fillna(0.0) > 0.5
+    )
+
+    candle_quality = (
+        (output["m1_range_ratio"] >= cfg.min_range_ratio)
+        & (output["m1_range_ratio"] <= cfg.max_range_ratio)
+        & (output["m1_body_ratio"] >= cfg.min_body_ratio)
+        & (output["m1_body_ratio"] <= cfg.max_body_ratio)
+    )
+
     output["m1_long_trigger"] = (
-        (output["close"] > output["m1_long_break_level"])
+        output["m1_recent_long_touch"]
+        & (output["close"] > output["m1_long_break_level"])
         & (output["close"] > output["open"])
         & (output["close"] > output["m1_ema_fast"])
         & (output["m1_ema_fast"] > output["m1_ema_fast"].shift(1))
         & (output["m1_ema_fast"] >= output["m1_ema_mid"])
-        & (output["m1_range_ratio"] >= cfg.min_range_expansion)
-        & (output["m1_body_ratio"] >= cfg.min_body_ratio)
+        & candle_quality
+        & (output["m1_close_location_long"] >= cfg.min_close_location)
         & (output["m1_distance_ema12_atr"] <= cfg.max_entry_stretch_atr)
     )
     output["m1_short_trigger"] = (
-        (output["close"] < output["m1_short_break_level"])
+        output["m1_recent_short_touch"]
+        & (output["close"] < output["m1_short_break_level"])
         & (output["close"] < output["open"])
         & (output["close"] < output["m1_ema_fast"])
         & (output["m1_ema_fast"] < output["m1_ema_fast"].shift(1))
         & (output["m1_ema_fast"] <= output["m1_ema_mid"])
-        & (output["m1_range_ratio"] >= cfg.min_range_expansion)
-        & (output["m1_body_ratio"] >= cfg.min_body_ratio)
+        & candle_quality
+        & (output["m1_close_location_short"] >= cfg.min_close_location)
         & (-output["m1_distance_ema12_atr"] <= cfg.max_entry_stretch_atr)
     )
     return output
@@ -927,6 +980,43 @@ def max_streak(values: Iterable[bool], target: bool) -> int:
     return maximum
 
 
+def _direction_metrics(frame: pd.DataFrame, direction: str) -> Dict[str, Any]:
+    side = frame.loc[frame["direction"] == direction].copy()
+    prefix = direction.lower()
+
+    if side.empty:
+        return {
+            f"{prefix}_trades": 0,
+            f"{prefix}_tp": 0,
+            f"{prefix}_sl": 0,
+            f"{prefix}_regime_exit": 0,
+            f"{prefix}_win_rate_net_pct": None,
+            f"{prefix}_profit_factor_net_r": None,
+            f"{prefix}_expectancy_net_r": None,
+            f"{prefix}_net_r": 0.0,
+            f"{prefix}_avg_mfe_r": None,
+            f"{prefix}_avg_mae_r": None,
+        }
+
+    positive = side.loc[side["pnl_r_net"] > 0, "pnl_r_net"].sum()
+    negative_abs = -side.loc[side["pnl_r_net"] < 0, "pnl_r_net"].sum()
+
+    return {
+        f"{prefix}_trades": int(len(side)),
+        f"{prefix}_tp": int((side["exit_reason"] == "TP").sum()),
+        f"{prefix}_sl": int((side["exit_reason"] == "SL").sum()),
+        f"{prefix}_regime_exit": int((side["exit_reason"] == "REGIME").sum()),
+        f"{prefix}_win_rate_net_pct": float((side["pnl_r_net"] > 0).mean() * 100.0),
+        f"{prefix}_profit_factor_net_r": (
+            float(positive / negative_abs) if negative_abs > 0 else None
+        ),
+        f"{prefix}_expectancy_net_r": float(side["pnl_r_net"].mean()),
+        f"{prefix}_net_r": float(side["pnl_r_net"].sum()),
+        f"{prefix}_avg_mfe_r": float(side["mfe_r"].mean()),
+        f"{prefix}_avg_mae_r": float(side["mae_r"].mean()),
+    }
+
+
 def summarize_symbol(
     symbol: str,
     meta: Optional[ContractMeta],
@@ -936,34 +1026,39 @@ def summarize_symbol(
     counters: Dict[str, int],
 ) -> Dict[str, Any]:
     frame = pd.DataFrame(trades)
+    base: Dict[str, Any] = {
+        "ticker": symbol,
+        "max_leverage": meta.max_leverage if meta else None,
+        "open_trades": int(open_trade is not None),
+        "rejected_setups": len(rejected),
+        **counters,
+    }
 
     if frame.empty:
-        return {
-            "ticker": symbol,
-            "max_leverage": meta.max_leverage if meta else None,
-            "closed_trades": 0,
-            "open_trades": int(open_trade is not None),
-            "long_trades": 0,
-            "short_trades": 0,
-            "tp": 0,
-            "sl": 0,
-            "regime_exit": 0,
-            "profitable_trades": 0,
-            "losing_trades": 0,
-            "win_rate_net_pct": None,
-            "profit_factor_net_r": None,
-            "expectancy_net_r": None,
-            "net_r": 0.0,
-            "max_drawdown_r": 0.0,
-            "max_losing_streak": 0,
-            "max_winning_streak": 0,
-            "avg_mfe_r": None,
-            "avg_mae_r": None,
-            "avg_trade_duration_min": None,
-            "median_trade_duration_min": None,
-            "rejected_setups": len(rejected),
-            **counters,
-        }
+        base.update(
+            {
+                "closed_trades": 0,
+                "tp": 0,
+                "sl": 0,
+                "regime_exit": 0,
+                "profitable_trades": 0,
+                "losing_trades": 0,
+                "win_rate_net_pct": None,
+                "profit_factor_net_r": None,
+                "expectancy_net_r": None,
+                "net_r": 0.0,
+                "max_drawdown_r": 0.0,
+                "max_losing_streak": 0,
+                "max_winning_streak": 0,
+                "avg_mfe_r": None,
+                "avg_mae_r": None,
+                "avg_trade_duration_min": None,
+                "median_trade_duration_min": None,
+            }
+        )
+        base.update(_direction_metrics(frame, "LONG"))
+        base.update(_direction_metrics(frame, "SHORT"))
+        return base
 
     frame = frame.sort_values("exit_time_utc").reset_index(drop=True)
     frame["cumulative_r"] = frame["pnl_r_net"].cumsum()
@@ -974,32 +1069,32 @@ def summarize_symbol(
     negative_abs = -frame.loc[frame["pnl_r_net"] < 0, "pnl_r_net"].sum()
     profitable_flags = frame["pnl_r_net"] > 0
 
-    return {
-        "ticker": symbol,
-        "max_leverage": meta.max_leverage if meta else None,
-        "closed_trades": int(len(frame)),
-        "open_trades": int(open_trade is not None),
-        "long_trades": int((frame["direction"] == "LONG").sum()),
-        "short_trades": int((frame["direction"] == "SHORT").sum()),
-        "tp": int((frame["exit_reason"] == "TP").sum()),
-        "sl": int((frame["exit_reason"] == "SL").sum()),
-        "regime_exit": int((frame["exit_reason"] == "REGIME").sum()),
-        "profitable_trades": int(profitable_flags.sum()),
-        "losing_trades": int((frame["pnl_r_net"] < 0).sum()),
-        "win_rate_net_pct": float(profitable_flags.mean() * 100.0),
-        "profit_factor_net_r": float(positive / negative_abs) if negative_abs > 0 else None,
-        "expectancy_net_r": float(frame["pnl_r_net"].mean()),
-        "net_r": float(frame["pnl_r_net"].sum()),
-        "max_drawdown_r": float(frame["drawdown_r"].min()),
-        "max_losing_streak": max_streak(profitable_flags, False),
-        "max_winning_streak": max_streak(profitable_flags, True),
-        "avg_mfe_r": float(frame["mfe_r"].mean()),
-        "avg_mae_r": float(frame["mae_r"].mean()),
-        "avg_trade_duration_min": float(frame["duration_minutes"].mean()),
-        "median_trade_duration_min": float(frame["duration_minutes"].median()),
-        "rejected_setups": len(rejected),
-        **counters,
-    }
+    base.update(
+        {
+            "closed_trades": int(len(frame)),
+            "tp": int((frame["exit_reason"] == "TP").sum()),
+            "sl": int((frame["exit_reason"] == "SL").sum()),
+            "regime_exit": int((frame["exit_reason"] == "REGIME").sum()),
+            "profitable_trades": int(profitable_flags.sum()),
+            "losing_trades": int((frame["pnl_r_net"] < 0).sum()),
+            "win_rate_net_pct": float(profitable_flags.mean() * 100.0),
+            "profit_factor_net_r": (
+                float(positive / negative_abs) if negative_abs > 0 else None
+            ),
+            "expectancy_net_r": float(frame["pnl_r_net"].mean()),
+            "net_r": float(frame["pnl_r_net"].sum()),
+            "max_drawdown_r": float(frame["drawdown_r"].min()),
+            "max_losing_streak": max_streak(profitable_flags, False),
+            "max_winning_streak": max_streak(profitable_flags, True),
+            "avg_mfe_r": float(frame["mfe_r"].mean()),
+            "avg_mae_r": float(frame["mae_r"].mean()),
+            "avg_trade_duration_min": float(frame["duration_minutes"].mean()),
+            "median_trade_duration_min": float(frame["duration_minutes"].median()),
+        }
+    )
+    base.update(_direction_metrics(frame, "LONG"))
+    base.update(_direction_metrics(frame, "SHORT"))
+    return base
 
 
 def scan_symbol(
@@ -1026,13 +1121,10 @@ def scan_symbol(
     m5 = prepare_m5(resample_ohlcv(raw_m1, 5), cfg)
     m15 = prepare_m15(resample_ohlcv(raw_m1, 15), cfg)
 
-    m15_columns = [
-        column for column in m15.columns if column.startswith("m15_")
-    ]
-    m5_columns = [
-        column for column in m5.columns if column.startswith("m5_")
-    ]
+    m15_columns = [column for column in m15.columns if column.startswith("m15_")]
+    m5_columns = [column for column in m5.columns if column.startswith("m5_")]
 
+    # Exact Pine [1] + lookahead_on behavior: only the previous closed HTF bar.
     m1 = m1.join(map_previous_closed_timeframe(m15, m1.index, m15_columns))
     m1 = m1.join(map_previous_closed_timeframe(m5, m1.index, m5_columns))
 
@@ -1059,14 +1151,14 @@ def scan_symbol(
         "m5_short_pullback_bars": 0,
         "m1_long_triggers": 0,
         "m1_short_triggers": 0,
+        "dynamic_long_stops": 0,
+        "dynamic_short_stops": 0,
     }
 
     active_trade: Optional[OpenTrade] = None
     last_exit_index: Optional[int] = None
-    previous_long_pullback = False
-    previous_short_pullback = False
-    trade_opened_during_long_pullback = False
-    trade_opened_during_short_pullback = False
+    last_traded_long_pullback_id: Optional[int] = None
+    last_traded_short_pullback_id: Optional[int] = None
 
     for local_index, (_, row) in enumerate(simulation.iterrows()):
         current_time = int(row["time"])
@@ -1085,34 +1177,7 @@ def scan_symbol(
         counters["m1_long_triggers"] += int(long_trigger)
         counters["m1_short_triggers"] += int(short_trigger)
 
-        if long_pullback and not previous_long_pullback:
-            trade_opened_during_long_pullback = False
-        if short_pullback and not previous_short_pullback:
-            trade_opened_during_short_pullback = False
-
-        if previous_long_pullback and not long_pullback and not trade_opened_during_long_pullback:
-            rejected.append(
-                {
-                    "ticker": symbol,
-                    "time_utc": pd.to_datetime(current_time, unit="s", utc=True),
-                    "direction": "LONG",
-                    "rejection_reason": "PULLBACK_EXPIRED_NO_M1_TRIGGER",
-                }
-            )
-        if previous_short_pullback and not short_pullback and not trade_opened_during_short_pullback:
-            rejected.append(
-                {
-                    "ticker": symbol,
-                    "time_utc": pd.to_datetime(current_time, unit="s", utc=True),
-                    "direction": "SHORT",
-                    "rejection_reason": "PULLBACK_EXPIRED_NO_M1_TRIGGER",
-                }
-            )
-
-        previous_long_pullback = long_pullback
-        previous_short_pullback = short_pullback
-
-        # Manage an existing position from the first bar after entry.
+        # Manage an open position from the bar after entry.
         if active_trade is not None and local_index > active_trade.entry_index:
             active_trade.bars_held += 1
 
@@ -1138,10 +1203,7 @@ def scan_symbol(
             exit_price: Optional[float] = None
 
             if stop_hit and target_hit:
-                if cfg.conservative_same_candle:
-                    exit_reason = "SL"
-                else:
-                    exit_reason = "TP"
+                exit_reason = "SL" if cfg.conservative_same_candle else "TP"
             elif stop_hit:
                 exit_reason = "SL"
             elif target_hit:
@@ -1169,14 +1231,15 @@ def scan_symbol(
                     )
 
             if exit_reason is not None and exit_price is not None:
-                record = close_trade_record(
-                    active_trade,
-                    current_time,
-                    exit_price,
-                    exit_reason,
-                    commission_rate,
+                trades.append(
+                    close_trade_record(
+                        active_trade,
+                        current_time,
+                        exit_price,
+                        exit_reason,
+                        commission_rate,
+                    )
                 )
-                trades.append(record)
                 last_exit_index = local_index
                 active_trade = None
 
@@ -1186,56 +1249,116 @@ def scan_symbol(
             or local_index - last_exit_index > cfg.cooldown_after_exit_bars
         )
 
-        # Evaluate current M1 triggers after managing an existing position.
         for direction, trigger in (("LONG", long_trigger), ("SHORT", short_trigger)):
+            is_long = direction == "LONG"
+
+            if is_long and not cfg.allow_long:
+                continue
+            if not is_long and not cfg.allow_short:
+                continue
             if not trigger:
                 continue
 
-            is_long = direction == "LONG"
+            regime_ok = long_regime if is_long else short_regime
+            opposite_regime = short_regime if is_long else long_regime
+            pullback_ok = long_pullback if is_long else short_pullback
+
+            pullback_id_value = safe_value(
+                row.get(
+                    "m5_long_pullback_id"
+                    if is_long
+                    else "m5_short_pullback_id"
+                )
+            )
+            pullback_id = int(pullback_id_value) if pullback_id_value is not None else None
+            last_traded_id = (
+                last_traded_long_pullback_id
+                if is_long
+                else last_traded_short_pullback_id
+            )
+            pullback_unused = (
+                not cfg.one_trade_per_pullback
+                or (
+                    pullback_id is not None
+                    and (last_traded_id is None or pullback_id != last_traded_id)
+                )
+            )
+
             signal_close = float(row["close"])
             m5_atr = safe_value(row.get("m5_atr"))
             swing_price = safe_value(
                 row.get("m5_swing_low" if is_long else "m5_swing_high")
             )
 
-            if m5_atr is None or m5_atr <= 0 or swing_price is None:
-                risk_atr = np.nan
-                stop_candidate = np.nan
-            elif is_long:
-                stop_candidate = swing_price - m5_atr * cfg.stop_buffer_m5_atr
-                risk_atr = (signal_close - stop_candidate) / m5_atr
-            else:
-                stop_candidate = swing_price + m5_atr * cfg.stop_buffer_m5_atr
-                risk_atr = (stop_candidate - signal_close) / m5_atr
+            reason: Optional[str] = None
+            if not flat:
+                reason = "POSITION_ALREADY_OPEN"
+            elif not cooldown_ready:
+                reason = "COOLDOWN"
+            elif not regime_ok:
+                reason = "M15_REGIME_MISSING"
+            elif opposite_regime:
+                reason = "OPPOSITE_M15_REGIME"
+            elif not pullback_ok:
+                reason = "M5_PULLBACK_MISSING"
+            elif not pullback_unused:
+                reason = "PULLBACK_ALREADY_TRADED"
+            elif m5_atr is None or m5_atr <= 0 or swing_price is None:
+                reason = "RISK_NOT_AVAILABLE"
 
-            reason = rejection_reason(
-                row,
-                direction,
-                risk_atr,
-                cfg,
-                flat=flat,
-                cooldown_ready=cooldown_ready,
-            )
+            raw_stop = np.nan
+            stop_candidate = np.nan
+            risk_atr = np.nan
+            risk_pct = np.nan
+            target_pct = np.nan
+            stop_expanded = False
+
+            if reason is None and m5_atr is not None and swing_price is not None:
+                minimum_stop_distance = max(
+                    signal_close * cfg.min_stop_distance_pct / 100.0,
+                    m5_atr * cfg.min_stop_distance_m5_atr,
+                )
+
+                if is_long:
+                    raw_stop = swing_price - m5_atr * cfg.stop_buffer_m5_atr
+                    stop_floor = signal_close - minimum_stop_distance
+                    stop_candidate = min(raw_stop, stop_floor)
+                    risk = signal_close - stop_candidate
+                    stop_expanded = stop_candidate < raw_stop
+                else:
+                    raw_stop = swing_price + m5_atr * cfg.stop_buffer_m5_atr
+                    stop_floor = signal_close + minimum_stop_distance
+                    stop_candidate = max(raw_stop, stop_floor)
+                    risk = stop_candidate - signal_close
+                    stop_expanded = stop_candidate > raw_stop
+
+                risk_atr = risk / m5_atr
+                risk_pct = risk / signal_close * 100.0
+                target_pct = risk_pct * cfg.reward_risk
+
+                if risk <= price_tick:
+                    reason = "NON_POSITIVE_INITIAL_RISK"
+                elif risk_atr > cfg.max_stop_distance_m5_atr:
+                    reason = "SL_TOO_WIDE_ATR"
+                elif risk_pct > cfg.max_stop_distance_pct:
+                    reason = "SL_TOO_WIDE_PCT"
+                elif target_pct < cfg.min_target_distance_pct:
+                    reason = "TARGET_TOO_CLOSE"
+                elif target_pct > cfg.max_target_distance_pct:
+                    reason = "TARGET_TOO_FAR"
 
             if reason is not None:
                 rejection = {
                     "ticker": symbol,
                     "time_utc": pd.to_datetime(current_time, unit="s", utc=True),
                     "direction": direction,
-                    "m15_regime_ok": (
-                        long_regime if is_long else short_regime
-                    ),
-                    "m5_pullback_ok": (
-                        long_pullback if is_long else short_pullback
-                    ),
+                    "m15_regime_ok": regime_ok,
+                    "m5_pullback_ok": pullback_ok,
                     "m1_trigger_ok": True,
-                    "risk_valid": (
-                        finite(risk_atr)
-                        and cfg.min_stop_distance_m5_atr
-                        <= float(risk_atr)
-                        <= cfg.max_stop_distance_m5_atr
-                    ),
+                    "pullback_id": pullback_id,
                     "risk_m5_atr": safe_value(risk_atr),
+                    "risk_pct": safe_value(risk_pct),
+                    "target_pct": safe_value(target_pct),
                     "rejection_reason": reason,
                 }
                 if finite(risk_atr):
@@ -1243,31 +1366,37 @@ def scan_symbol(
                 rejected.append(rejection)
                 continue
 
-            entry_price = signal_close + slippage_value if is_long else signal_close - slippage_value
+            # Pine strategy order fill with one tick of slippage.
+            entry_price = (
+                signal_close + slippage_value
+                if is_long
+                else signal_close - slippage_value
+            )
             initial_risk = (
                 entry_price - float(stop_candidate)
                 if is_long
                 else float(stop_candidate) - entry_price
             )
 
-            if initial_risk <= 0:
-                rejected.append(
-                    {
-                        "ticker": symbol,
-                        "time_utc": pd.to_datetime(current_time, unit="s", utc=True),
-                        "direction": direction,
-                        "rejection_reason": "NON_POSITIVE_INITIAL_RISK",
-                    }
-                )
-                continue
-
+            # Exact v6: 3R from actual simulated fill price.
             target_price = (
-                signal_close + (signal_close - float(stop_candidate)) * cfg.reward_risk
+                entry_price + initial_risk * cfg.reward_risk
                 if is_long
-                else signal_close - (float(stop_candidate) - signal_close) * cfg.reward_risk
+                else entry_price - initial_risk * cfg.reward_risk
             )
 
             snapshot = build_snapshot(row, direction, float(risk_atr))
+            snapshot.update(
+                {
+                    "pullback_id": pullback_id,
+                    "raw_stop_price": float(raw_stop),
+                    "dynamic_stop_expanded": stop_expanded,
+                    "signal_risk_pct": float(risk_pct),
+                    "signal_target_pct": float(target_pct),
+                    "reward_risk": cfg.reward_risk,
+                }
+            )
+
             active_trade = OpenTrade(
                 ticker=symbol,
                 direction=direction,
@@ -1280,13 +1409,13 @@ def scan_symbol(
                 initial_risk=initial_risk,
                 entry_snapshot=snapshot,
             )
-            flat = False
 
-            if direction == "LONG":
-                trade_opened_during_long_pullback = True
+            if is_long:
+                last_traded_long_pullback_id = pullback_id
+                counters["dynamic_long_stops"] += int(stop_expanded)
             else:
-                trade_opened_during_short_pullback = True
-
+                last_traded_short_pullback_id = pullback_id
+                counters["dynamic_short_stops"] += int(stop_expanded)
             break
 
     if active_trade is not None:
@@ -1305,12 +1434,7 @@ def scan_symbol(
         open_rows.append(open_record)
 
     ranking = summarize_symbol(
-        symbol,
-        meta,
-        trades,
-        active_trade,
-        rejected,
-        counters,
+        symbol, meta, trades, active_trade, rejected, counters
     )
 
     if trades:
@@ -1345,17 +1469,16 @@ def csv_or_empty(rows: List[Dict[str, Any]], columns: Sequence[str], path: Path)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Diagnostic backtest of M15 regime -> M5 pullback -> M1 trigger."
+        description="Exact 30-day MEXC backtest of Pine MTF Pullback Quality v6 — 3R."
     )
     source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--all", action="store_true", help="Scan all enabled USDT contracts.")
-    source.add_argument("--symbols", nargs="+", help="Example: BTC_USDT ETH_USDT SUI_USDT")
+    source.add_argument("--all", action="store_true")
+    source.add_argument("--symbols", nargs="+")
 
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--min-max-leverage", type=int, default=None)
     parser.add_argument("--days", type=int, default=30)
     parser.add_argument("--warmup-days", type=int, default=7)
-    parser.add_argument("--rr", type=float, default=2.0)
+    parser.add_argument("--rr", type=float, default=3.0)
     parser.add_argument("--commission-percent", type=float, default=0.06)
     parser.add_argument("--slippage-ticks", type=int, default=1)
     parser.add_argument(
@@ -1363,37 +1486,112 @@ def parse_args() -> argparse.Namespace:
         choices=("conservative", "optimistic"),
         default="conservative",
     )
-    parser.add_argument(
-        "--exit-on-regime-loss",
-        dest="exit_on_regime_loss",
-        action="store_true",
-        default=True,
-    )
-    parser.add_argument(
-        "--no-regime-exit",
-        dest="exit_on_regime_loss",
-        action="store_false",
-    )
+    parser.add_argument("--allow-long", action="store_true", default=True)
+    parser.add_argument("--no-long", dest="allow_long", action="store_false")
+    parser.add_argument("--allow-short", action="store_true", default=True)
+    parser.add_argument("--no-short", dest="allow_short", action="store_false")
+    parser.add_argument("--exit-on-regime-loss", action="store_true", default=False)
+    parser.add_argument("--no-regime-exit", dest="exit_on_regime_loss", action="store_false")
 
-    parser.add_argument("--min-regime-strength", type=float, default=68.0)
-    parser.add_argument("--min-regime-er", type=float, default=0.20)
+    # All Pine v6 parameters are CLI-editable for future workflow changes.
+    parser.add_argument("--min-regime-er", type=float, default=0.22)
     parser.add_argument("--min-regime-slope-atr", type=float, default=0.08)
+    parser.add_argument("--max-regime-slope-atr", type=float, default=0.80)
+    parser.add_argument("--min-regime-stretch-atr", type=float, default=0.00)
     parser.add_argument("--max-regime-stretch-atr", type=float, default=2.50)
-    parser.add_argument("--pullback-valid-bars", type=int, default=4)
-    parser.add_argument("--min-range-expansion", type=float, default=1.10)
-    parser.add_argument("--min-body-ratio", type=float, default=0.55)
-    parser.add_argument("--max-entry-stretch-atr", type=float, default=0.80)
-    parser.add_argument("--min-stop-atr", type=float, default=0.25)
-    parser.add_argument("--max-stop-atr", type=float, default=2.00)
+    parser.add_argument("--min-regime-strength", type=float, default=60.0)
+    parser.add_argument("--max-regime-age-bars", type=int, default=20)
 
-    parser.add_argument("--ranking-output", default="ranking_mtf.csv")
-    parser.add_argument("--trades-output", default="trades_mtf.csv")
-    parser.add_argument("--rejected-output", default="rejected_setups.csv")
-    parser.add_argument("--equity-output", default="equity_curve_mtf.csv")
-    parser.add_argument("--open-output", default="open_trades_mtf.csv")
-    parser.add_argument("--config-output", default="run_config.json")
+    parser.add_argument("--pullback-valid-bars", type=int, default=3)
+    parser.add_argument("--zone-buffer-atr", type=float, default=0.15)
+    parser.add_argument("--max-mid-overshoot-atr", type=float, default=0.25)
+    parser.add_argument("--min-pullback-atr-ratio", type=float, default=0.60)
+    parser.add_argument("--max-pullback-atr-ratio", type=float, default=1.00)
+
+    parser.add_argument("--micro-touch-lookback", type=int, default=3)
+    parser.add_argument("--breakout-lookback", type=int, default=2)
+    parser.add_argument("--min-range-ratio", type=float, default=0.80)
+    parser.add_argument("--max-range-ratio", type=float, default=1.60)
+    parser.add_argument("--min-body-ratio", type=float, default=0.45)
+    parser.add_argument("--max-body-ratio", type=float, default=0.85)
+    parser.add_argument("--min-close-location", type=float, default=0.70)
+    parser.add_argument("--max-entry-stretch-atr", type=float, default=0.50)
+
+    parser.add_argument("--m5-swing-lookback", type=int, default=10)
+    parser.add_argument("--stop-buffer-m5-atr", type=float, default=0.10)
+    parser.add_argument("--min-stop-atr", type=float, default=0.75)
+    parser.add_argument("--max-stop-atr", type=float, default=2.50)
+    parser.add_argument("--min-stop-pct", type=float, default=0.50)
+    parser.add_argument("--max-stop-pct", type=float, default=3.00)
+    parser.add_argument("--min-target-pct", type=float, default=1.50)
+    parser.add_argument("--max-target-pct", type=float, default=9.00)
+    parser.add_argument("--cooldown-bars", type=int, default=10)
+
+    parser.add_argument("--ranking-output", default="ranking_v6_3r.csv")
+    parser.add_argument("--trades-output", default="trades_v6_3r.csv")
+    parser.add_argument("--rejected-output", default="rejected_v6_3r.csv")
+    parser.add_argument("--equity-output", default="equity_v6_3r.csv")
+    parser.add_argument("--open-output", default="open_v6_3r.csv")
+    parser.add_argument("--summary-output", default="summary_v6_3r.csv")
+    parser.add_argument("--config-output", default="run_config_v6_3r.json")
     parser.add_argument("--request-sleep", type=float, default=0.12)
     return parser.parse_args()
+
+
+def combined_summary(trades: List[Dict[str, Any]]) -> pd.DataFrame:
+    frame = pd.DataFrame(trades)
+    rows: List[Dict[str, Any]] = []
+
+    for label, part in (
+        ("ALL", frame),
+        ("LONG", frame.loc[frame["direction"] == "LONG"] if not frame.empty else frame),
+        ("SHORT", frame.loc[frame["direction"] == "SHORT"] if not frame.empty else frame),
+    ):
+        if part.empty:
+            rows.append(
+                {
+                    "scope": label,
+                    "trades": 0,
+                    "tp": 0,
+                    "sl": 0,
+                    "win_rate_pct": None,
+                    "profit_factor_net_r": None,
+                    "expectancy_net_r": None,
+                    "net_r": 0.0,
+                    "avg_mfe_r": None,
+                    "avg_mae_r": None,
+                    "max_drawdown_r": 0.0,
+                }
+            )
+            continue
+
+        ordered = part.sort_values("exit_time_utc").copy()
+        ordered["cum_r"] = ordered["pnl_r_net"].cumsum()
+        ordered["peak_r"] = ordered["cum_r"].cummax().clip(lower=0.0)
+        ordered["dd_r"] = ordered["cum_r"] - ordered["peak_r"]
+
+        positive = ordered.loc[ordered["pnl_r_net"] > 0, "pnl_r_net"].sum()
+        negative_abs = -ordered.loc[ordered["pnl_r_net"] < 0, "pnl_r_net"].sum()
+
+        rows.append(
+            {
+                "scope": label,
+                "trades": int(len(ordered)),
+                "tp": int((ordered["exit_reason"] == "TP").sum()),
+                "sl": int((ordered["exit_reason"] == "SL").sum()),
+                "win_rate_pct": float((ordered["pnl_r_net"] > 0).mean() * 100.0),
+                "profit_factor_net_r": (
+                    float(positive / negative_abs) if negative_abs > 0 else None
+                ),
+                "expectancy_net_r": float(ordered["pnl_r_net"].mean()),
+                "net_r": float(ordered["pnl_r_net"].sum()),
+                "avg_mfe_r": float(ordered["mfe_r"].mean()),
+                "avg_mae_r": float(ordered["mae_r"].mean()),
+                "max_drawdown_r": float(ordered["dd_r"].min()),
+            }
+        )
+
+    return pd.DataFrame(rows)
 
 
 def main() -> None:
@@ -1401,8 +1599,8 @@ def main() -> None:
 
     if args.days <= 0:
         raise SystemExit("--days must be greater than zero.")
-    if args.rr <= 0:
-        raise SystemExit("--rr must be greater than zero.")
+    if args.rr < 3.0:
+        raise SystemExit("Pine v6 requires RR >= 3.0.")
 
     cfg = StrategyConfig(
         days=args.days,
@@ -1412,16 +1610,41 @@ def main() -> None:
         slippage_ticks=args.slippage_ticks,
         conservative_same_candle=args.same_candle_policy == "conservative",
         exit_on_regime_loss=args.exit_on_regime_loss,
-        min_regime_strength=args.min_regime_strength,
+        cooldown_after_exit_bars=args.cooldown_bars,
+        allow_long=args.allow_long,
+        allow_short=args.allow_short,
+
         min_regime_er=args.min_regime_er,
         min_regime_slope_atr=args.min_regime_slope_atr,
+        max_regime_slope_atr=args.max_regime_slope_atr,
+        min_regime_stretch_atr=args.min_regime_stretch_atr,
         max_regime_stretch_atr=args.max_regime_stretch_atr,
+        min_regime_strength=args.min_regime_strength,
+        max_regime_age_bars=args.max_regime_age_bars,
+
         pullback_valid_bars=args.pullback_valid_bars,
-        min_range_expansion=args.min_range_expansion,
+        zone_buffer_atr=args.zone_buffer_atr,
+        max_mid_overshoot_atr=args.max_mid_overshoot_atr,
+        min_pullback_atr_ratio=args.min_pullback_atr_ratio,
+        max_pullback_atr_ratio=args.max_pullback_atr_ratio,
+
+        micro_touch_lookback=args.micro_touch_lookback,
+        breakout_lookback=args.breakout_lookback,
+        min_range_ratio=args.min_range_ratio,
+        max_range_ratio=args.max_range_ratio,
         min_body_ratio=args.min_body_ratio,
+        max_body_ratio=args.max_body_ratio,
+        min_close_location=args.min_close_location,
         max_entry_stretch_atr=args.max_entry_stretch_atr,
+
+        m5_swing_lookback=args.m5_swing_lookback,
+        stop_buffer_m5_atr=args.stop_buffer_m5_atr,
         min_stop_distance_m5_atr=args.min_stop_atr,
         max_stop_distance_m5_atr=args.max_stop_atr,
+        min_stop_distance_pct=args.min_stop_pct,
+        max_stop_distance_pct=args.max_stop_pct,
+        min_target_distance_pct=args.min_target_pct,
+        max_target_distance_pct=args.max_target_pct,
     )
 
     client = MexcPublicClient(request_sleep=args.request_sleep)
@@ -1429,39 +1652,26 @@ def main() -> None:
     meta_map = get_contract_meta(client)
 
     if args.all:
-        symbols = get_contract_symbols(
-            meta_map,
-            limit=args.limit,
-            min_max_leverage=args.min_max_leverage,
-        )
+        symbols = get_contract_symbols(meta_map, limit=args.limit)
     else:
         symbols = sorted(set(args.symbols or []))
-        if args.min_max_leverage is not None:
-            symbols = [
-                symbol
-                for symbol in symbols
-                if symbol in meta_map
-                and meta_map[symbol].max_leverage is not None
-                and meta_map[symbol].max_leverage >= args.min_max_leverage
-            ]
         if args.limit:
             symbols = symbols[: args.limit]
 
     if not symbols:
-        raise SystemExit("No symbols selected after applying filters.")
+        raise SystemExit("No symbols selected.")
 
-    # The final complete M1 candle starts one minute before the current minute.
     now = int(time.time())
     end_time = (now // 60) * 60 - 60
     start_time = end_time - cfg.days * 24 * 60 * 60
 
     config_payload = {
+        "pine_version": "MTF Pullback Quality Strategy v6 — 3R",
         "strategy_config": asdict(cfg),
         "symbols": symbols,
         "start_time_utc": pd.to_datetime(start_time, unit="s", utc=True).isoformat(),
         "end_time_utc": pd.to_datetime(end_time, unit="s", utc=True).isoformat(),
         "same_candle_policy": args.same_candle_policy,
-        "requested_min_max_leverage": args.min_max_leverage,
     }
     Path(args.config_output).write_text(
         json.dumps(config_payload, indent=2, ensure_ascii=False),
@@ -1476,21 +1686,13 @@ def main() -> None:
 
     for position, symbol in enumerate(symbols, start=1):
         meta = meta_map.get(symbol)
-        print(
-            f"[{position}/{len(symbols)}] {symbol} "
-            f"max_leverage={meta.max_leverage if meta else None}"
-        )
+        print(f"[{position}/{len(symbols)}] scanning {symbol}...")
 
         success = False
         for attempt in range(1, 4):
             try:
                 ranking, trades, rejected, equity, open_rows = scan_symbol(
-                    client,
-                    symbol,
-                    cfg,
-                    meta,
-                    start_time,
-                    end_time,
+                    client, symbol, cfg, meta, start_time, end_time
                 )
                 rankings.append(ranking)
                 all_trades.extend(trades)
@@ -1499,11 +1701,8 @@ def main() -> None:
                 all_open.extend(open_rows)
                 success = True
                 break
-            except Exception as exc:  # noqa: BLE001
-                print(
-                    f"ERROR {symbol} attempt {attempt}/3: {exc}",
-                    file=sys.stderr,
-                )
+            except Exception as exc:
+                print(f"ERROR {symbol} attempt {attempt}/3: {exc}", file=sys.stderr)
                 if attempt < 3:
                     time.sleep(3 * attempt)
 
@@ -1518,105 +1717,33 @@ def main() -> None:
 
     ranking_frame = pd.DataFrame(rankings)
     if not ranking_frame.empty:
-        sort_columns = [
-            column
-            for column in ("profit_factor_net_r", "expectancy_net_r", "closed_trades")
-            if column in ranking_frame.columns
-        ]
-        if sort_columns:
-            ascending = [False] * len(sort_columns)
-            ranking_frame = ranking_frame.sort_values(
-                sort_columns,
-                ascending=ascending,
-                na_position="last",
-            )
+        ranking_frame = ranking_frame.sort_values(
+            ["profit_factor_net_r", "expectancy_net_r", "closed_trades"],
+            ascending=[False, False, False],
+            na_position="last",
+        )
     ranking_frame.to_csv(args.ranking_output, index=False)
 
-    csv_or_empty(
-        all_trades,
-        [
-            "ticker",
-            "direction",
-            "entry_time_utc",
-            "exit_time_utc",
-            "entry_price",
-            "stop_price",
-            "target_price",
-            "exit_price",
-            "exit_reason",
-            "pnl_r_net",
-            "mfe_r",
-            "mae_r",
-        ],
-        Path(args.trades_output),
-    )
-    csv_or_empty(
-        all_rejected,
-        [
-            "ticker",
-            "time_utc",
-            "direction",
-            "rejection_reason",
-        ],
-        Path(args.rejected_output),
-    )
-    csv_or_empty(
-        all_equity,
-        [
-            "exit_time_utc",
-            "ticker",
-            "trade_number",
-            "pnl_r_net",
-            "cumulative_r",
-            "drawdown_r",
-        ],
-        Path(args.equity_output),
-    )
-    csv_or_empty(
-        all_open,
-        [
-            "ticker",
-            "direction",
-            "entry_time_utc",
-            "entry_price",
-            "stop_price",
-            "target_price",
-        ],
-        Path(args.open_output),
-    )
+    csv_or_empty(all_trades, ["ticker", "direction", "entry_time_utc", "exit_time_utc"], Path(args.trades_output))
+    csv_or_empty(all_rejected, ["ticker", "time_utc", "direction", "rejection_reason"], Path(args.rejected_output))
+    csv_or_empty(all_equity, ["exit_time_utc", "ticker", "pnl_r_net", "cumulative_r"], Path(args.equity_output))
+    csv_or_empty(all_open, ["ticker", "direction", "entry_time_utc"], Path(args.open_output))
+    combined_summary(all_trades).to_csv(args.summary_output, index=False)
 
-    print("\nTop results:")
-    if ranking_frame.empty:
-        print("No ranking rows.")
-    else:
-        preview_columns = [
-            column
-            for column in (
-                "ticker",
-                "closed_trades",
-                "tp",
-                "sl",
-                "regime_exit",
-                "win_rate_net_pct",
-                "profit_factor_net_r",
-                "expectancy_net_r",
-                "net_r",
-                "max_drawdown_r",
-            )
-            if column in ranking_frame.columns
-        ]
-        print(ranking_frame[preview_columns].head(30).to_string(index=False))
+    print("\nCombined summary:")
+    print(combined_summary(all_trades).to_string(index=False))
 
     print("\nSaved:")
-    for output_path in (
+    for output in (
         args.ranking_output,
         args.trades_output,
         args.rejected_output,
         args.equity_output,
         args.open_output,
+        args.summary_output,
         args.config_output,
     ):
-        print(f"  {output_path}")
+        print(f"  {output}")
 
 
 if __name__ == "__main__":
