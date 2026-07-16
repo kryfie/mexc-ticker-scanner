@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-MTF Pullback Quality v6 3R Scanner for MEXC USDT-M perpetual futures.
+MTF Pullback Quality v7 Multi-Variant Scanner for MEXC USDT-M perpetual futures.
 
-Exact model replicated from Pine: MTF Pullback Quality Strategy v6 — 3R.
+Multi-variant diagnostic model based on Pine MTF Pullback Quality Strategy v6 — 3R.
     M15 -> fresh directional regime with age/slope/stretch limits
     M5  -> controlled pullback
     M1  -> micro-touch + breakout quality trigger
@@ -10,12 +10,14 @@ Exact model replicated from Pine: MTF Pullback Quality Strategy v6 — 3R.
     TP  -> minimum 3R from simulated fill price
 
 Outputs:
-    ranking_mtf.csv
-    trades_mtf.csv
-    rejected_setups.csv
-    equity_curve_mtf.csv
-    open_trades_mtf.csv
-    run_config.json
+    v7_variants_scorecard.csv
+    v7_variants_period_summary.csv
+    v7_variants_ticker_summary.csv
+    v7_variants_trades.csv
+    v7_variants_rejections.csv
+    v7_variants_equity.csv
+    v7_variants_open.csv
+    v7_variants_config.json
 
 The scanner uses only public MEXC market endpoints. No API key is required.
 """
@@ -27,6 +29,7 @@ import json
 import math
 import sys
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -130,15 +133,31 @@ class StrategyConfig:
     max_target_distance_pct: float = 9.00
 
 
+@dataclass(frozen=True)
+class VariantSpec:
+    name: str
+    description: str
+    allow_long: bool = True
+    allow_short: bool = True
+    max_m5_volume_ratio: Optional[float] = None
+    max_m5_pullback_depth_atr: Optional[float] = None
+    min_m1_range_ratio: Optional[float] = None
+    min_m1_distance_ema50_atr: Optional[float] = None
+    protect_trigger_r: Optional[float] = None
+    protect_lock_r: float = 0.0
+
+
 @dataclass
 class OpenTrade:
+    variant: str
     ticker: str
     direction: str
     entry_index: int
     entry_time: int
     signal_close: float
     entry_price: float
-    stop_price: float
+    initial_stop_price: float
+    active_stop_price: float
     target_price: float
     initial_risk: float
     entry_snapshot: Dict[str, Any]
@@ -148,6 +167,9 @@ class OpenTrade:
     bars_to_mfe: int = 0
     bars_to_mae: int = 0
     bars_held: int = 0
+    protection_triggered: bool = False
+    protection_trigger_bar: Optional[int] = None
+    protection_lock_r: float = 0.0
 
 
 class MexcPublicClient:
@@ -163,7 +185,7 @@ class MexcPublicClient:
         self.session = requests.Session()
         self.session.headers.update(
             {
-                "User-Agent": "mtf-pullback-quality-v6-scanner/1.0",
+                "User-Agent": "mtf-pullback-quality-v7-variants/1.0",
                 "Accept": "application/json",
             }
         )
@@ -937,13 +959,15 @@ def close_trade_record(
     mae_r = trade.mae_price / trade.initial_risk
 
     record: Dict[str, Any] = {
+        "variant": trade.variant,
         "ticker": trade.ticker,
         "direction": trade.direction,
         "entry_time_utc": pd.to_datetime(trade.entry_time, unit="s", utc=True),
         "exit_time_utc": pd.to_datetime(exit_time, unit="s", utc=True),
         "entry_price": trade.entry_price,
         "signal_close": trade.signal_close,
-        "stop_price": trade.stop_price,
+        "initial_stop_price": trade.initial_stop_price,
+        "final_stop_price": trade.active_stop_price,
         "target_price": trade.target_price,
         "exit_price": exit_price,
         "exit_reason": exit_reason,
@@ -959,10 +983,14 @@ def close_trade_record(
         "mae_r": mae_r,
         "bars_to_mfe": trade.bars_to_mfe,
         "bars_to_mae": trade.bars_to_mae,
+        "protection_triggered": trade.protection_triggered,
+        "protection_trigger_bar": trade.protection_trigger_bar,
+        "protection_lock_r": trade.protection_lock_r,
         "reached_0_5r": mfe_r >= 0.5,
         "reached_1r": mfe_r >= 1.0,
         "reached_1_5r": mfe_r >= 1.5,
         "reached_2r": mfe_r >= 2.0,
+        "reached_3r": mfe_r >= 3.0,
     }
     record.update(trade.entry_snapshot)
     return record
@@ -980,180 +1008,212 @@ def max_streak(values: Iterable[bool], target: bool) -> int:
     return maximum
 
 
-def _direction_metrics(frame: pd.DataFrame, direction: str) -> Dict[str, Any]:
-    side = frame.loc[frame["direction"] == direction].copy()
-    prefix = direction.lower()
 
-    if side.empty:
+
+def build_variants() -> List[VariantSpec]:
+    """Variants isolate each hypothesis before combining them."""
+    return [
+        VariantSpec(
+            name="A_BASE_V6_3R",
+            description="Exact v6 baseline: pure SL or 3R TP.",
+        ),
+        VariantSpec(
+            name="B_EMA50_08",
+            description="Baseline + entry at least 0.80 ATR from M1 EMA50.",
+            min_m1_distance_ema50_atr=0.80,
+        ),
+        VariantSpec(
+            name="C_RANGE_11",
+            description="Baseline + M1 trigger range at least 1.10 of average.",
+            min_m1_range_ratio=1.10,
+        ),
+        VariantSpec(
+            name="D_PULLBACK_QUALITY",
+            description="Baseline + quiet/shallow M5 pullback.",
+            max_m5_volume_ratio=0.90,
+            max_m5_pullback_depth_atr=1.70,
+        ),
+        VariantSpec(
+            name="E_ALL_FILTERS",
+            description="All four quality filters, pure SL or 3R TP.",
+            max_m5_volume_ratio=0.90,
+            max_m5_pullback_depth_atr=1.70,
+            min_m1_range_ratio=1.10,
+            min_m1_distance_ema50_atr=0.80,
+        ),
+        VariantSpec(
+            name="F_ALL_SHORT_ONLY",
+            description="All filters, SHORT signals only.",
+            allow_long=False,
+            allow_short=True,
+            max_m5_volume_ratio=0.90,
+            max_m5_pullback_depth_atr=1.70,
+            min_m1_range_ratio=1.10,
+            min_m1_distance_ema50_atr=0.80,
+        ),
+        VariantSpec(
+            name="G_ALL_LONG_ONLY",
+            description="All filters, LONG signals only.",
+            allow_long=True,
+            allow_short=False,
+            max_m5_volume_ratio=0.90,
+            max_m5_pullback_depth_atr=1.70,
+            min_m1_range_ratio=1.10,
+            min_m1_distance_ema50_atr=0.80,
+        ),
+        VariantSpec(
+            name="H_ALL_BE_AT_1_5R",
+            description="All filters; after 1.5R move stop to entry for next bar.",
+            max_m5_volume_ratio=0.90,
+            max_m5_pullback_depth_atr=1.70,
+            min_m1_range_ratio=1.10,
+            min_m1_distance_ema50_atr=0.80,
+            protect_trigger_r=1.50,
+            protect_lock_r=0.00,
+        ),
+        VariantSpec(
+            name="I_ALL_BE_AT_2R",
+            description="All filters; after 2R move stop to entry for next bar.",
+            max_m5_volume_ratio=0.90,
+            max_m5_pullback_depth_atr=1.70,
+            min_m1_range_ratio=1.10,
+            min_m1_distance_ema50_atr=0.80,
+            protect_trigger_r=2.00,
+            protect_lock_r=0.00,
+        ),
+        VariantSpec(
+            name="J_ALL_LOCK_0_5R_AT_2R",
+            description="All filters; after 2R lock +0.5R for next bar.",
+            max_m5_volume_ratio=0.90,
+            max_m5_pullback_depth_atr=1.70,
+            min_m1_range_ratio=1.10,
+            min_m1_distance_ema50_atr=0.80,
+            protect_trigger_r=2.00,
+            protect_lock_r=0.50,
+        ),
+    ]
+
+
+def variant_filter_reason(
+    row: pd.Series,
+    direction: str,
+    variant: VariantSpec,
+) -> Optional[str]:
+    is_long = direction == "LONG"
+    side = "long" if is_long else "short"
+
+    tests = [
+        ("m5_volume_ratio", variant.max_m5_volume_ratio, "FILTER_M5_VOLUME", "max"),
+        (f"m5_{side}_pullback_depth_atr", variant.max_m5_pullback_depth_atr, "FILTER_M5_DEPTH", "max"),
+        ("m1_range_ratio", variant.min_m1_range_ratio, "FILTER_M1_RANGE", "min"),
+    ]
+
+    for column, threshold, reason, mode in tests:
+        if threshold is None:
+            continue
+        value = safe_value(row.get(column))
+        if value is None:
+            return "FILTER_DATA_MISSING"
+        if mode == "max" and value > threshold:
+            return reason
+        if mode == "min" and value < threshold:
+            return reason
+
+    if variant.min_m1_distance_ema50_atr is not None:
+        raw = safe_value(row.get("m1_distance_ema50_atr"))
+        if raw is None:
+            return "FILTER_DATA_MISSING"
+        directional_distance = raw if is_long else -raw
+        if directional_distance < variant.min_m1_distance_ema50_atr:
+            return "FILTER_M1_EMA50_DISTANCE"
+
+    return None
+
+
+def apply_protection_after_bar(trade: OpenTrade, variant: VariantSpec) -> None:
+    """Conservative: a newly moved stop is active from the next M1 bar."""
+    if variant.protect_trigger_r is None or trade.protection_triggered:
+        return
+
+    mfe_r = trade.mfe_price / trade.initial_risk
+    if mfe_r < variant.protect_trigger_r:
+        return
+
+    if trade.direction == "LONG":
+        protected_stop = trade.entry_price + variant.protect_lock_r * trade.initial_risk
+        if protected_stop > trade.active_stop_price:
+            trade.active_stop_price = protected_stop
+    else:
+        protected_stop = trade.entry_price - variant.protect_lock_r * trade.initial_risk
+        if protected_stop < trade.active_stop_price:
+            trade.active_stop_price = protected_stop
+
+    trade.protection_triggered = True
+    trade.protection_trigger_bar = trade.bars_held
+    trade.protection_lock_r = variant.protect_lock_r
+
+
+def summarize_trade_frame(frame: pd.DataFrame) -> Dict[str, Any]:
+    if frame.empty:
         return {
-            f"{prefix}_trades": 0,
-            f"{prefix}_tp": 0,
-            f"{prefix}_sl": 0,
-            f"{prefix}_regime_exit": 0,
-            f"{prefix}_win_rate_net_pct": None,
-            f"{prefix}_profit_factor_net_r": None,
-            f"{prefix}_expectancy_net_r": None,
-            f"{prefix}_net_r": 0.0,
-            f"{prefix}_avg_mfe_r": None,
-            f"{prefix}_avg_mae_r": None,
+            "trades": 0,
+            "tp": 0,
+            "sl": 0,
+            "be": 0,
+            "lock": 0,
+            "profitable_trades": 0,
+            "win_rate_pct": None,
+            "profit_factor_net_r": None,
+            "expectancy_net_r": None,
+            "net_r": 0.0,
+            "max_drawdown_r": 0.0,
+            "max_losing_streak": 0,
+            "max_winning_streak": 0,
+            "avg_mfe_r": None,
+            "avg_mae_r": None,
+            "avg_duration_min": None,
         }
 
-    positive = side.loc[side["pnl_r_net"] > 0, "pnl_r_net"].sum()
-    negative_abs = -side.loc[side["pnl_r_net"] < 0, "pnl_r_net"].sum()
+    ordered = frame.sort_values("exit_time_utc").copy()
+    ordered["cum_r"] = ordered["pnl_r_net"].cumsum()
+    ordered["peak_r"] = ordered["cum_r"].cummax().clip(lower=0.0)
+    ordered["dd_r"] = ordered["cum_r"] - ordered["peak_r"]
+    positive = ordered.loc[ordered["pnl_r_net"] > 0, "pnl_r_net"].sum()
+    negative_abs = -ordered.loc[ordered["pnl_r_net"] < 0, "pnl_r_net"].sum()
+    wins = ordered["pnl_r_net"] > 0
 
     return {
-        f"{prefix}_trades": int(len(side)),
-        f"{prefix}_tp": int((side["exit_reason"] == "TP").sum()),
-        f"{prefix}_sl": int((side["exit_reason"] == "SL").sum()),
-        f"{prefix}_regime_exit": int((side["exit_reason"] == "REGIME").sum()),
-        f"{prefix}_win_rate_net_pct": float((side["pnl_r_net"] > 0).mean() * 100.0),
-        f"{prefix}_profit_factor_net_r": (
-            float(positive / negative_abs) if negative_abs > 0 else None
-        ),
-        f"{prefix}_expectancy_net_r": float(side["pnl_r_net"].mean()),
-        f"{prefix}_net_r": float(side["pnl_r_net"].sum()),
-        f"{prefix}_avg_mfe_r": float(side["mfe_r"].mean()),
-        f"{prefix}_avg_mae_r": float(side["mae_r"].mean()),
+        "trades": int(len(ordered)),
+        "tp": int((ordered["exit_reason"] == "TP").sum()),
+        "sl": int((ordered["exit_reason"] == "SL").sum()),
+        "be": int((ordered["exit_reason"] == "BE").sum()),
+        "lock": int((ordered["exit_reason"] == "LOCK").sum()),
+        "profitable_trades": int(wins.sum()),
+        "win_rate_pct": float(wins.mean() * 100.0),
+        "profit_factor_net_r": float(positive / negative_abs) if negative_abs > 0 else None,
+        "expectancy_net_r": float(ordered["pnl_r_net"].mean()),
+        "net_r": float(ordered["pnl_r_net"].sum()),
+        "max_drawdown_r": float(ordered["dd_r"].min()),
+        "max_losing_streak": max_streak(wins, False),
+        "max_winning_streak": max_streak(wins, True),
+        "avg_mfe_r": float(ordered["mfe_r"].mean()),
+        "avg_mae_r": float(ordered["mae_r"].mean()),
+        "avg_duration_min": float(ordered["duration_minutes"].mean()),
     }
 
 
-def summarize_symbol(
+def simulate_variant(
     symbol: str,
-    meta: Optional[ContractMeta],
-    trades: List[Dict[str, Any]],
-    open_trade: Optional[OpenTrade],
-    rejected: List[Dict[str, Any]],
-    counters: Dict[str, int],
-) -> Dict[str, Any]:
-    frame = pd.DataFrame(trades)
-    base: Dict[str, Any] = {
-        "ticker": symbol,
-        "max_leverage": meta.max_leverage if meta else None,
-        "open_trades": int(open_trade is not None),
-        "rejected_setups": len(rejected),
-        **counters,
-    }
-
-    if frame.empty:
-        base.update(
-            {
-                "closed_trades": 0,
-                "tp": 0,
-                "sl": 0,
-                "regime_exit": 0,
-                "profitable_trades": 0,
-                "losing_trades": 0,
-                "win_rate_net_pct": None,
-                "profit_factor_net_r": None,
-                "expectancy_net_r": None,
-                "net_r": 0.0,
-                "max_drawdown_r": 0.0,
-                "max_losing_streak": 0,
-                "max_winning_streak": 0,
-                "avg_mfe_r": None,
-                "avg_mae_r": None,
-                "avg_trade_duration_min": None,
-                "median_trade_duration_min": None,
-            }
-        )
-        base.update(_direction_metrics(frame, "LONG"))
-        base.update(_direction_metrics(frame, "SHORT"))
-        return base
-
-    frame = frame.sort_values("exit_time_utc").reset_index(drop=True)
-    frame["cumulative_r"] = frame["pnl_r_net"].cumsum()
-    frame["equity_peak_r"] = frame["cumulative_r"].cummax().clip(lower=0.0)
-    frame["drawdown_r"] = frame["cumulative_r"] - frame["equity_peak_r"]
-
-    positive = frame.loc[frame["pnl_r_net"] > 0, "pnl_r_net"].sum()
-    negative_abs = -frame.loc[frame["pnl_r_net"] < 0, "pnl_r_net"].sum()
-    profitable_flags = frame["pnl_r_net"] > 0
-
-    base.update(
-        {
-            "closed_trades": int(len(frame)),
-            "tp": int((frame["exit_reason"] == "TP").sum()),
-            "sl": int((frame["exit_reason"] == "SL").sum()),
-            "regime_exit": int((frame["exit_reason"] == "REGIME").sum()),
-            "profitable_trades": int(profitable_flags.sum()),
-            "losing_trades": int((frame["pnl_r_net"] < 0).sum()),
-            "win_rate_net_pct": float(profitable_flags.mean() * 100.0),
-            "profit_factor_net_r": (
-                float(positive / negative_abs) if negative_abs > 0 else None
-            ),
-            "expectancy_net_r": float(frame["pnl_r_net"].mean()),
-            "net_r": float(frame["pnl_r_net"].sum()),
-            "max_drawdown_r": float(frame["drawdown_r"].min()),
-            "max_losing_streak": max_streak(profitable_flags, False),
-            "max_winning_streak": max_streak(profitable_flags, True),
-            "avg_mfe_r": float(frame["mfe_r"].mean()),
-            "avg_mae_r": float(frame["mae_r"].mean()),
-            "avg_trade_duration_min": float(frame["duration_minutes"].mean()),
-            "median_trade_duration_min": float(frame["duration_minutes"].median()),
-        }
-    )
-    base.update(_direction_metrics(frame, "LONG"))
-    base.update(_direction_metrics(frame, "SHORT"))
-    return base
-
-
-def scan_symbol(
-    client: MexcPublicClient,
-    symbol: str,
+    simulation: pd.DataFrame,
     cfg: StrategyConfig,
-    meta: Optional[ContractMeta],
-    start_time: int,
-    end_time: int,
-) -> Tuple[
-    Dict[str, Any],
-    List[Dict[str, Any]],
-    List[Dict[str, Any]],
-    List[Dict[str, Any]],
-    List[Dict[str, Any]],
-]:
-    warmup_start = start_time - cfg.warmup_days * 24 * 60 * 60
-    raw_m1 = fetch_klines(client, symbol, "Min1", warmup_start, end_time)
-
-    if len(raw_m1) < cfg.regime_slow_len * 15:
-        raise RuntimeError(f"Insufficient M1 history: {len(raw_m1)} rows")
-
-    m1 = prepare_m1(raw_m1, cfg)
-    m5 = prepare_m5(resample_ohlcv(raw_m1, 5), cfg)
-    m15 = prepare_m15(resample_ohlcv(raw_m1, 15), cfg)
-
-    m15_columns = [column for column in m15.columns if column.startswith("m15_")]
-    m5_columns = [column for column in m5.columns if column.startswith("m5_")]
-
-    # Exact Pine [1] + lookahead_on behavior: only the previous closed HTF bar.
-    m1 = m1.join(map_previous_closed_timeframe(m15, m1.index, m15_columns))
-    m1 = m1.join(map_previous_closed_timeframe(m5, m1.index, m5_columns))
-
-    simulation = m1[(m1["time"] >= start_time) & (m1["time"] <= end_time)].copy()
-    simulation = simulation.sort_index()
-
-    price_tick = meta.price_unit if meta and meta.price_unit else None
-    if price_tick is None or price_tick <= 0:
-        price_scale = meta.price_scale if meta and meta.price_scale is not None else 8
-        price_tick = 10.0 ** (-price_scale)
-
+    variant: VariantSpec,
+    price_tick: float,
+) -> Tuple[List[Dict[str, Any]], Counter, List[Dict[str, Any]]]:
     commission_rate = cfg.commission_percent / 100.0
     slippage_value = cfg.slippage_ticks * price_tick
-
     trades: List[Dict[str, Any]] = []
-    rejected: List[Dict[str, Any]] = []
-    equity_rows: List[Dict[str, Any]] = []
     open_rows: List[Dict[str, Any]] = []
-
-    counters = {
-        "m15_long_regime_bars": 0,
-        "m15_short_regime_bars": 0,
-        "m5_long_pullback_bars": 0,
-        "m5_short_pullback_bars": 0,
-        "m1_long_triggers": 0,
-        "m1_short_triggers": 0,
-        "dynamic_long_stops": 0,
-        "dynamic_short_stops": 0,
-    }
+    rejection_counts: Counter = Counter()
 
     active_trade: Optional[OpenTrade] = None
     last_exit_index: Optional[int] = None
@@ -1162,7 +1222,6 @@ def scan_symbol(
 
     for local_index, (_, row) in enumerate(simulation.iterrows()):
         current_time = int(row["time"])
-
         long_regime = safe_bool(row.get("m15_long_regime", False))
         short_regime = safe_bool(row.get("m15_short_regime", False))
         long_pullback = safe_bool(row.get("m5_long_pullback", False))
@@ -1170,26 +1229,18 @@ def scan_symbol(
         long_trigger = safe_bool(row.get("m1_long_trigger", False))
         short_trigger = safe_bool(row.get("m1_short_trigger", False))
 
-        counters["m15_long_regime_bars"] += int(long_regime)
-        counters["m15_short_regime_bars"] += int(short_regime)
-        counters["m5_long_pullback_bars"] += int(long_pullback)
-        counters["m5_short_pullback_bars"] += int(short_pullback)
-        counters["m1_long_triggers"] += int(long_trigger)
-        counters["m1_short_triggers"] += int(short_trigger)
-
-        # Manage an open position from the bar after entry.
         if active_trade is not None and local_index > active_trade.entry_index:
             active_trade.bars_held += 1
 
             if active_trade.direction == "LONG":
                 favorable = max(0.0, float(row["high"]) - active_trade.entry_price)
                 adverse = max(0.0, active_trade.entry_price - float(row["low"]))
-                stop_hit = float(row["low"]) <= active_trade.stop_price
+                stop_hit = float(row["low"]) <= active_trade.active_stop_price
                 target_hit = float(row["high"]) >= active_trade.target_price
             else:
                 favorable = max(0.0, active_trade.entry_price - float(row["low"]))
                 adverse = max(0.0, float(row["high"]) - active_trade.entry_price)
-                stop_hit = float(row["high"]) >= active_trade.stop_price
+                stop_hit = float(row["high"]) >= active_trade.active_stop_price
                 target_hit = float(row["low"]) <= active_trade.target_price
 
             if favorable > active_trade.mfe_price:
@@ -1203,25 +1254,34 @@ def scan_symbol(
             exit_price: Optional[float] = None
 
             if stop_hit and target_hit:
-                exit_reason = "SL" if cfg.conservative_same_candle else "TP"
+                stop_wins = cfg.conservative_same_candle
+                exit_reason = None if not stop_wins else (
+                    "LOCK" if active_trade.protection_triggered and active_trade.protection_lock_r > 0
+                    else "BE" if active_trade.protection_triggered
+                    else "SL"
+                )
+                if not stop_wins:
+                    exit_reason = "TP"
             elif stop_hit:
-                exit_reason = "SL"
+                exit_reason = (
+                    "LOCK" if active_trade.protection_triggered and active_trade.protection_lock_r > 0
+                    else "BE" if active_trade.protection_triggered
+                    else "SL"
+                )
             elif target_hit:
                 exit_reason = "TP"
 
-            if exit_reason == "SL":
+            if exit_reason in {"SL", "BE", "LOCK"}:
                 exit_price = (
-                    active_trade.stop_price - slippage_value
+                    active_trade.active_stop_price - slippage_value
                     if active_trade.direction == "LONG"
-                    else active_trade.stop_price + slippage_value
+                    else active_trade.active_stop_price + slippage_value
                 )
             elif exit_reason == "TP":
                 exit_price = active_trade.target_price
 
             if exit_reason is None and cfg.exit_on_regime_loss:
-                regime_alive = (
-                    long_regime if active_trade.direction == "LONG" else short_regime
-                )
+                regime_alive = long_regime if active_trade.direction == "LONG" else short_regime
                 if not regime_alive:
                     exit_reason = "REGIME"
                     exit_price = (
@@ -1231,17 +1291,13 @@ def scan_symbol(
                     )
 
             if exit_reason is not None and exit_price is not None:
-                trades.append(
-                    close_trade_record(
-                        active_trade,
-                        current_time,
-                        exit_price,
-                        exit_reason,
-                        commission_rate,
-                    )
-                )
+                trades.append(close_trade_record(
+                    active_trade, current_time, exit_price, exit_reason, commission_rate
+                ))
                 last_exit_index = local_index
                 active_trade = None
+            else:
+                apply_protection_after_bar(active_trade, variant)
 
         flat = active_trade is None
         cooldown_ready = (
@@ -1251,7 +1307,10 @@ def scan_symbol(
 
         for direction, trigger in (("LONG", long_trigger), ("SHORT", short_trigger)):
             is_long = direction == "LONG"
-
+            if is_long and not variant.allow_long:
+                continue
+            if not is_long and not variant.allow_short:
+                continue
             if is_long and not cfg.allow_long:
                 continue
             if not is_long and not cfg.allow_short:
@@ -1262,32 +1321,16 @@ def scan_symbol(
             regime_ok = long_regime if is_long else short_regime
             opposite_regime = short_regime if is_long else long_regime
             pullback_ok = long_pullback if is_long else short_pullback
-
-            pullback_id_value = safe_value(
-                row.get(
-                    "m5_long_pullback_id"
-                    if is_long
-                    else "m5_short_pullback_id"
-                )
-            )
+            pullback_id_value = safe_value(row.get(
+                "m5_long_pullback_id" if is_long else "m5_short_pullback_id"
+            ))
             pullback_id = int(pullback_id_value) if pullback_id_value is not None else None
             last_traded_id = (
-                last_traded_long_pullback_id
-                if is_long
-                else last_traded_short_pullback_id
+                last_traded_long_pullback_id if is_long else last_traded_short_pullback_id
             )
             pullback_unused = (
                 not cfg.one_trade_per_pullback
-                or (
-                    pullback_id is not None
-                    and (last_traded_id is None or pullback_id != last_traded_id)
-                )
-            )
-
-            signal_close = float(row["close"])
-            m5_atr = safe_value(row.get("m5_atr"))
-            swing_price = safe_value(
-                row.get("m5_swing_low" if is_long else "m5_swing_high")
+                or (pullback_id is not None and pullback_id != last_traded_id)
             )
 
             reason: Optional[str] = None
@@ -1303,9 +1346,12 @@ def scan_symbol(
                 reason = "M5_PULLBACK_MISSING"
             elif not pullback_unused:
                 reason = "PULLBACK_ALREADY_TRADED"
-            elif m5_atr is None or m5_atr <= 0 or swing_price is None:
-                reason = "RISK_NOT_AVAILABLE"
+            else:
+                reason = variant_filter_reason(row, direction, variant)
 
+            signal_close = float(row["close"])
+            m5_atr = safe_value(row.get("m5_atr"))
+            swing_price = safe_value(row.get("m5_swing_low" if is_long else "m5_swing_high"))
             raw_stop = np.nan
             stop_candidate = np.nan
             risk_atr = np.nan
@@ -1313,12 +1359,14 @@ def scan_symbol(
             target_pct = np.nan
             stop_expanded = False
 
+            if reason is None and (m5_atr is None or m5_atr <= 0 or swing_price is None):
+                reason = "RISK_NOT_AVAILABLE"
+
             if reason is None and m5_atr is not None and swing_price is not None:
                 minimum_stop_distance = max(
                     signal_close * cfg.min_stop_distance_pct / 100.0,
                     m5_atr * cfg.min_stop_distance_m5_atr,
                 )
-
                 if is_long:
                     raw_stop = swing_price - m5_atr * cfg.stop_buffer_m5_atr
                     stop_floor = signal_close - minimum_stop_distance
@@ -1348,63 +1396,44 @@ def scan_symbol(
                     reason = "TARGET_TOO_FAR"
 
             if reason is not None:
-                rejection = {
-                    "ticker": symbol,
-                    "time_utc": pd.to_datetime(current_time, unit="s", utc=True),
-                    "direction": direction,
-                    "m15_regime_ok": regime_ok,
-                    "m5_pullback_ok": pullback_ok,
-                    "m1_trigger_ok": True,
-                    "pullback_id": pullback_id,
-                    "risk_m5_atr": safe_value(risk_atr),
-                    "risk_pct": safe_value(risk_pct),
-                    "target_pct": safe_value(target_pct),
-                    "rejection_reason": reason,
-                }
-                if finite(risk_atr):
-                    rejection.update(build_snapshot(row, direction, float(risk_atr)))
-                rejected.append(rejection)
+                rejection_counts[(direction, reason)] += 1
                 continue
 
-            # Pine strategy order fill with one tick of slippage.
-            entry_price = (
-                signal_close + slippage_value
-                if is_long
-                else signal_close - slippage_value
-            )
+            entry_price = signal_close + slippage_value if is_long else signal_close - slippage_value
             initial_risk = (
                 entry_price - float(stop_candidate)
-                if is_long
-                else float(stop_candidate) - entry_price
+                if is_long else float(stop_candidate) - entry_price
             )
-
-            # Exact v6: 3R from actual simulated fill price.
             target_price = (
                 entry_price + initial_risk * cfg.reward_risk
-                if is_long
-                else entry_price - initial_risk * cfg.reward_risk
+                if is_long else entry_price - initial_risk * cfg.reward_risk
             )
-
             snapshot = build_snapshot(row, direction, float(risk_atr))
-            snapshot.update(
-                {
-                    "pullback_id": pullback_id,
-                    "raw_stop_price": float(raw_stop),
-                    "dynamic_stop_expanded": stop_expanded,
-                    "signal_risk_pct": float(risk_pct),
-                    "signal_target_pct": float(target_pct),
-                    "reward_risk": cfg.reward_risk,
-                }
-            )
-
+            snapshot.update({
+                "variant_description": variant.description,
+                "pullback_id": pullback_id,
+                "raw_stop_price": float(raw_stop),
+                "dynamic_stop_expanded": stop_expanded,
+                "signal_risk_pct": float(risk_pct),
+                "signal_target_pct": float(target_pct),
+                "reward_risk": cfg.reward_risk,
+                "variant_max_m5_volume_ratio": variant.max_m5_volume_ratio,
+                "variant_max_m5_pullback_depth_atr": variant.max_m5_pullback_depth_atr,
+                "variant_min_m1_range_ratio": variant.min_m1_range_ratio,
+                "variant_min_m1_distance_ema50_atr": variant.min_m1_distance_ema50_atr,
+                "variant_protect_trigger_r": variant.protect_trigger_r,
+                "variant_protect_lock_r": variant.protect_lock_r,
+            })
             active_trade = OpenTrade(
+                variant=variant.name,
                 ticker=symbol,
                 direction=direction,
                 entry_index=local_index,
                 entry_time=current_time,
                 signal_close=signal_close,
                 entry_price=entry_price,
-                stop_price=float(stop_candidate),
+                initial_stop_price=float(stop_candidate),
+                active_stop_price=float(stop_candidate),
                 target_price=float(target_price),
                 initial_risk=initial_risk,
                 entry_snapshot=snapshot,
@@ -1412,195 +1441,201 @@ def scan_symbol(
 
             if is_long:
                 last_traded_long_pullback_id = pullback_id
-                counters["dynamic_long_stops"] += int(stop_expanded)
             else:
                 last_traded_short_pullback_id = pullback_id
-                counters["dynamic_short_stops"] += int(stop_expanded)
             break
 
     if active_trade is not None:
-        open_record = {
+        open_row = {
+            "variant": variant.name,
             "ticker": symbol,
             "direction": active_trade.direction,
             "entry_time_utc": pd.to_datetime(active_trade.entry_time, unit="s", utc=True),
             "entry_price": active_trade.entry_price,
-            "stop_price": active_trade.stop_price,
+            "initial_stop_price": active_trade.initial_stop_price,
+            "active_stop_price": active_trade.active_stop_price,
             "target_price": active_trade.target_price,
             "mfe_r_so_far": active_trade.mfe_price / active_trade.initial_risk,
             "mae_r_so_far": active_trade.mae_price / active_trade.initial_risk,
-            "bars_held": active_trade.bars_held,
+            "protection_triggered": active_trade.protection_triggered,
         }
-        open_record.update(active_trade.entry_snapshot)
-        open_rows.append(open_record)
+        open_row.update(active_trade.entry_snapshot)
+        open_rows.append(open_row)
 
-    ranking = summarize_symbol(
-        symbol, meta, trades, active_trade, rejected, counters
-    )
+    return trades, rejection_counts, open_rows
 
-    if trades:
-        equity = pd.DataFrame(trades).sort_values("exit_time_utc").reset_index(drop=True)
-        equity["trade_number"] = np.arange(1, len(equity) + 1)
-        equity["cumulative_r"] = equity["pnl_r_net"].cumsum()
-        equity["peak_r"] = equity["cumulative_r"].cummax().clip(lower=0.0)
-        equity["drawdown_r"] = equity["cumulative_r"] - equity["peak_r"]
-        equity_rows = equity[
-            [
-                "exit_time_utc",
-                "ticker",
-                "trade_number",
-                "direction",
-                "exit_reason",
-                "pnl_r_net",
-                "cumulative_r",
-                "drawdown_r",
-            ]
-        ].to_dict("records")
 
-    return ranking, trades, rejected, equity_rows, open_rows
+def prepare_symbol_data(
+    client: MexcPublicClient,
+    symbol: str,
+    cfg: StrategyConfig,
+    start_time: int,
+    end_time: int,
+) -> pd.DataFrame:
+    warmup_start = start_time - cfg.warmup_days * 24 * 60 * 60
+    raw_m1 = fetch_klines(client, symbol, "Min1", warmup_start, end_time)
+    if len(raw_m1) < cfg.regime_slow_len * 15:
+        raise RuntimeError(f"Insufficient M1 history: {len(raw_m1)} rows")
+
+    m1 = prepare_m1(raw_m1, cfg)
+    m5 = prepare_m5(resample_ohlcv(raw_m1, 5), cfg)
+    m15 = prepare_m15(resample_ohlcv(raw_m1, 15), cfg)
+    m15_columns = [column for column in m15.columns if column.startswith("m15_")]
+    m5_columns = [column for column in m5.columns if column.startswith("m5_")]
+    m1 = m1.join(map_previous_closed_timeframe(m15, m1.index, m15_columns))
+    m1 = m1.join(map_previous_closed_timeframe(m5, m1.index, m5_columns))
+    return m1[(m1["time"] >= start_time) & (m1["time"] <= end_time)].sort_index()
+
+
+def period_summary_rows(
+    trades: pd.DataFrame,
+    variants: List[VariantSpec],
+    start_time: int,
+    end_time: int,
+) -> List[Dict[str, Any]]:
+    midpoint = start_time + (end_time - start_time) // 2
+    periods = [
+        ("FULL", start_time, end_time + 1),
+        ("FIRST_HALF", start_time, midpoint),
+        ("SECOND_HALF", midpoint, end_time + 1),
+    ]
+    rows: List[Dict[str, Any]] = []
+
+    for variant in variants:
+        variant_frame = trades.loc[trades["variant"] == variant.name].copy() if not trades.empty else trades
+        for period_name, period_start, period_end in periods:
+            if variant_frame.empty:
+                period_frame = variant_frame
+            else:
+                entry_seconds = pd.to_datetime(variant_frame["entry_time_utc"], utc=True).astype("int64") // 10**9
+                period_frame = variant_frame.loc[(entry_seconds >= period_start) & (entry_seconds < period_end)]
+            for scope in ("ALL", "LONG", "SHORT"):
+                scoped = period_frame if scope == "ALL" else period_frame.loc[period_frame["direction"] == scope]
+                row = {
+                    "variant": variant.name,
+                    "description": variant.description,
+                    "period": period_name,
+                    "scope": scope,
+                }
+                row.update(summarize_trade_frame(scoped))
+                rows.append(row)
+    return rows
+
+
+def build_scorecard(period_summary: pd.DataFrame) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    for (variant, scope), group in period_summary.groupby(["variant", "scope"], dropna=False):
+        lookup = group.set_index("period")
+        def value(period: str, column: str) -> Any:
+            return lookup.at[period, column] if period in lookup.index else None
+
+        first_exp = value("FIRST_HALF", "expectancy_net_r")
+        second_exp = value("SECOND_HALF", "expectancy_net_r")
+        full_exp = value("FULL", "expectancy_net_r")
+        first_exp_num = float(first_exp) if pd.notna(first_exp) else -999.0
+        second_exp_num = float(second_exp) if pd.notna(second_exp) else -999.0
+        full_trades = int(value("FULL", "trades") or 0)
+        min_half_exp = min(first_exp_num, second_exp_num)
+        stability_gap = abs(first_exp_num - second_exp_num) if first_exp_num > -900 and second_exp_num > -900 else None
+        robust_score = (
+            min_half_exp * math.sqrt(max(full_trades, 1))
+            if first_exp_num > -900 and second_exp_num > -900 else None
+        )
+        rows.append({
+            "variant": variant,
+            "scope": scope,
+            "full_trades": full_trades,
+            "full_tp": value("FULL", "tp"),
+            "full_sl": value("FULL", "sl"),
+            "full_be": value("FULL", "be"),
+            "full_lock": value("FULL", "lock"),
+            "full_pf": value("FULL", "profit_factor_net_r"),
+            "full_expectancy_r": full_exp,
+            "full_net_r": value("FULL", "net_r"),
+            "full_drawdown_r": value("FULL", "max_drawdown_r"),
+            "first_trades": value("FIRST_HALF", "trades"),
+            "first_pf": value("FIRST_HALF", "profit_factor_net_r"),
+            "first_expectancy_r": first_exp,
+            "first_net_r": value("FIRST_HALF", "net_r"),
+            "second_trades": value("SECOND_HALF", "trades"),
+            "second_pf": value("SECOND_HALF", "profit_factor_net_r"),
+            "second_expectancy_r": second_exp,
+            "second_net_r": value("SECOND_HALF", "net_r"),
+            "both_halves_positive": bool(first_exp_num > 0 and second_exp_num > 0),
+            "min_half_expectancy_r": min_half_exp if min_half_exp > -900 else None,
+            "half_expectancy_gap": stability_gap,
+            "robust_score": robust_score,
+        })
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        result = result.sort_values(
+            ["scope", "both_halves_positive", "robust_score", "full_trades"],
+            ascending=[True, False, False, False],
+            na_position="last",
+        )
+    return result
+
+
+def ticker_summary_rows(trades: pd.DataFrame, variants: List[VariantSpec], symbols: List[str]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for variant in variants:
+        for symbol in symbols:
+            subset = trades.loc[(trades["variant"] == variant.name) & (trades["ticker"] == symbol)] if not trades.empty else trades
+            for scope in ("ALL", "LONG", "SHORT"):
+                scoped = subset if scope == "ALL" else subset.loc[subset["direction"] == scope]
+                row = {"variant": variant.name, "ticker": symbol, "scope": scope}
+                row.update(summarize_trade_frame(scoped))
+                rows.append(row)
+    return rows
+
+
+def equity_rows(trades: pd.DataFrame) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if trades.empty:
+        return rows
+    for variant, group in trades.groupby("variant"):
+        ordered = group.sort_values("exit_time_utc").copy().reset_index(drop=True)
+        ordered["trade_number"] = np.arange(1, len(ordered) + 1)
+        ordered["cumulative_r"] = ordered["pnl_r_net"].cumsum()
+        ordered["peak_r"] = ordered["cumulative_r"].cummax().clip(lower=0.0)
+        ordered["drawdown_r"] = ordered["cumulative_r"] - ordered["peak_r"]
+        rows.extend(ordered[[
+            "variant", "exit_time_utc", "ticker", "trade_number", "direction",
+            "exit_reason", "pnl_r_net", "cumulative_r", "drawdown_r"
+        ]].to_dict("records"))
+    return rows
 
 
 def csv_or_empty(rows: List[Dict[str, Any]], columns: Sequence[str], path: Path) -> None:
-    if rows:
-        frame = pd.DataFrame(rows)
-    else:
-        frame = pd.DataFrame(columns=list(columns))
+    frame = pd.DataFrame(rows) if rows else pd.DataFrame(columns=list(columns))
     frame.to_csv(path, index=False)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Exact 30-day MEXC backtest of Pine MTF Pullback Quality v6 — 3R."
+        description="Compare v6 baseline, quality filters and BE/lock management on MEXC data."
     )
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--all", action="store_true")
     source.add_argument("--symbols", nargs="+")
-
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--days", type=int, default=30)
     parser.add_argument("--warmup-days", type=int, default=7)
     parser.add_argument("--rr", type=float, default=3.0)
     parser.add_argument("--commission-percent", type=float, default=0.06)
     parser.add_argument("--slippage-ticks", type=int, default=1)
-    parser.add_argument(
-        "--same-candle-policy",
-        choices=("conservative", "optimistic"),
-        default="conservative",
-    )
-    parser.add_argument("--allow-long", action="store_true", default=True)
-    parser.add_argument("--no-long", dest="allow_long", action="store_false")
-    parser.add_argument("--allow-short", action="store_true", default=True)
-    parser.add_argument("--no-short", dest="allow_short", action="store_false")
-    parser.add_argument("--exit-on-regime-loss", action="store_true", default=False)
-    parser.add_argument("--no-regime-exit", dest="exit_on_regime_loss", action="store_false")
-
-    # All Pine v6 parameters are CLI-editable for future workflow changes.
-    parser.add_argument("--min-regime-er", type=float, default=0.22)
-    parser.add_argument("--min-regime-slope-atr", type=float, default=0.08)
-    parser.add_argument("--max-regime-slope-atr", type=float, default=0.80)
-    parser.add_argument("--min-regime-stretch-atr", type=float, default=0.00)
-    parser.add_argument("--max-regime-stretch-atr", type=float, default=2.50)
-    parser.add_argument("--min-regime-strength", type=float, default=60.0)
-    parser.add_argument("--max-regime-age-bars", type=int, default=20)
-
-    parser.add_argument("--pullback-valid-bars", type=int, default=3)
-    parser.add_argument("--zone-buffer-atr", type=float, default=0.15)
-    parser.add_argument("--max-mid-overshoot-atr", type=float, default=0.25)
-    parser.add_argument("--min-pullback-atr-ratio", type=float, default=0.60)
-    parser.add_argument("--max-pullback-atr-ratio", type=float, default=1.00)
-
-    parser.add_argument("--micro-touch-lookback", type=int, default=3)
-    parser.add_argument("--breakout-lookback", type=int, default=2)
-    parser.add_argument("--min-range-ratio", type=float, default=0.80)
-    parser.add_argument("--max-range-ratio", type=float, default=1.60)
-    parser.add_argument("--min-body-ratio", type=float, default=0.45)
-    parser.add_argument("--max-body-ratio", type=float, default=0.85)
-    parser.add_argument("--min-close-location", type=float, default=0.70)
-    parser.add_argument("--max-entry-stretch-atr", type=float, default=0.50)
-
-    parser.add_argument("--m5-swing-lookback", type=int, default=10)
-    parser.add_argument("--stop-buffer-m5-atr", type=float, default=0.10)
-    parser.add_argument("--min-stop-atr", type=float, default=0.75)
-    parser.add_argument("--max-stop-atr", type=float, default=2.50)
-    parser.add_argument("--min-stop-pct", type=float, default=0.50)
-    parser.add_argument("--max-stop-pct", type=float, default=3.00)
-    parser.add_argument("--min-target-pct", type=float, default=1.50)
-    parser.add_argument("--max-target-pct", type=float, default=9.00)
-    parser.add_argument("--cooldown-bars", type=int, default=10)
-
-    parser.add_argument("--ranking-output", default="ranking_v6_3r.csv")
-    parser.add_argument("--trades-output", default="trades_v6_3r.csv")
-    parser.add_argument("--rejected-output", default="rejected_v6_3r.csv")
-    parser.add_argument("--equity-output", default="equity_v6_3r.csv")
-    parser.add_argument("--open-output", default="open_v6_3r.csv")
-    parser.add_argument("--summary-output", default="summary_v6_3r.csv")
-    parser.add_argument("--config-output", default="run_config_v6_3r.json")
+    parser.add_argument("--same-candle-policy", choices=("conservative", "optimistic"), default="conservative")
     parser.add_argument("--request-sleep", type=float, default=0.12)
+    parser.add_argument("--output-prefix", default="v7_variants")
     return parser.parse_args()
-
-
-def combined_summary(trades: List[Dict[str, Any]]) -> pd.DataFrame:
-    frame = pd.DataFrame(trades)
-    rows: List[Dict[str, Any]] = []
-
-    for label, part in (
-        ("ALL", frame),
-        ("LONG", frame.loc[frame["direction"] == "LONG"] if not frame.empty else frame),
-        ("SHORT", frame.loc[frame["direction"] == "SHORT"] if not frame.empty else frame),
-    ):
-        if part.empty:
-            rows.append(
-                {
-                    "scope": label,
-                    "trades": 0,
-                    "tp": 0,
-                    "sl": 0,
-                    "win_rate_pct": None,
-                    "profit_factor_net_r": None,
-                    "expectancy_net_r": None,
-                    "net_r": 0.0,
-                    "avg_mfe_r": None,
-                    "avg_mae_r": None,
-                    "max_drawdown_r": 0.0,
-                }
-            )
-            continue
-
-        ordered = part.sort_values("exit_time_utc").copy()
-        ordered["cum_r"] = ordered["pnl_r_net"].cumsum()
-        ordered["peak_r"] = ordered["cum_r"].cummax().clip(lower=0.0)
-        ordered["dd_r"] = ordered["cum_r"] - ordered["peak_r"]
-
-        positive = ordered.loc[ordered["pnl_r_net"] > 0, "pnl_r_net"].sum()
-        negative_abs = -ordered.loc[ordered["pnl_r_net"] < 0, "pnl_r_net"].sum()
-
-        rows.append(
-            {
-                "scope": label,
-                "trades": int(len(ordered)),
-                "tp": int((ordered["exit_reason"] == "TP").sum()),
-                "sl": int((ordered["exit_reason"] == "SL").sum()),
-                "win_rate_pct": float((ordered["pnl_r_net"] > 0).mean() * 100.0),
-                "profit_factor_net_r": (
-                    float(positive / negative_abs) if negative_abs > 0 else None
-                ),
-                "expectancy_net_r": float(ordered["pnl_r_net"].mean()),
-                "net_r": float(ordered["pnl_r_net"].sum()),
-                "avg_mfe_r": float(ordered["mfe_r"].mean()),
-                "avg_mae_r": float(ordered["mae_r"].mean()),
-                "max_drawdown_r": float(ordered["dd_r"].min()),
-            }
-        )
-
-    return pd.DataFrame(rows)
 
 
 def main() -> None:
     args = parse_args()
-
     if args.days <= 0:
         raise SystemExit("--days must be greater than zero.")
     if args.rr < 3.0:
-        raise SystemExit("Pine v6 requires RR >= 3.0.")
+        raise SystemExit("This test requires RR >= 3.0.")
 
     cfg = StrategyConfig(
         days=args.days,
@@ -1609,44 +1644,9 @@ def main() -> None:
         commission_percent=args.commission_percent,
         slippage_ticks=args.slippage_ticks,
         conservative_same_candle=args.same_candle_policy == "conservative",
-        exit_on_regime_loss=args.exit_on_regime_loss,
-        cooldown_after_exit_bars=args.cooldown_bars,
-        allow_long=args.allow_long,
-        allow_short=args.allow_short,
-
-        min_regime_er=args.min_regime_er,
-        min_regime_slope_atr=args.min_regime_slope_atr,
-        max_regime_slope_atr=args.max_regime_slope_atr,
-        min_regime_stretch_atr=args.min_regime_stretch_atr,
-        max_regime_stretch_atr=args.max_regime_stretch_atr,
-        min_regime_strength=args.min_regime_strength,
-        max_regime_age_bars=args.max_regime_age_bars,
-
-        pullback_valid_bars=args.pullback_valid_bars,
-        zone_buffer_atr=args.zone_buffer_atr,
-        max_mid_overshoot_atr=args.max_mid_overshoot_atr,
-        min_pullback_atr_ratio=args.min_pullback_atr_ratio,
-        max_pullback_atr_ratio=args.max_pullback_atr_ratio,
-
-        micro_touch_lookback=args.micro_touch_lookback,
-        breakout_lookback=args.breakout_lookback,
-        min_range_ratio=args.min_range_ratio,
-        max_range_ratio=args.max_range_ratio,
-        min_body_ratio=args.min_body_ratio,
-        max_body_ratio=args.max_body_ratio,
-        min_close_location=args.min_close_location,
-        max_entry_stretch_atr=args.max_entry_stretch_atr,
-
-        m5_swing_lookback=args.m5_swing_lookback,
-        stop_buffer_m5_atr=args.stop_buffer_m5_atr,
-        min_stop_distance_m5_atr=args.min_stop_atr,
-        max_stop_distance_m5_atr=args.max_stop_atr,
-        min_stop_distance_pct=args.min_stop_pct,
-        max_stop_distance_pct=args.max_stop_pct,
-        min_target_distance_pct=args.min_target_pct,
-        max_target_distance_pct=args.max_target_pct,
+        exit_on_regime_loss=False,
     )
-
+    variants = build_variants()
     client = MexcPublicClient(request_sleep=args.request_sleep)
     print("Loading MEXC contract metadata...")
     meta_map = get_contract_meta(client)
@@ -1656,8 +1656,7 @@ def main() -> None:
     else:
         symbols = sorted(set(args.symbols or []))
         if args.limit:
-            symbols = symbols[: args.limit]
-
+            symbols = symbols[:args.limit]
     if not symbols:
         raise SystemExit("No symbols selected.")
 
@@ -1665,85 +1664,101 @@ def main() -> None:
     end_time = (now // 60) * 60 - 60
     start_time = end_time - cfg.days * 24 * 60 * 60
 
-    config_payload = {
-        "pine_version": "MTF Pullback Quality Strategy v6 — 3R",
-        "strategy_config": asdict(cfg),
-        "symbols": symbols,
-        "start_time_utc": pd.to_datetime(start_time, unit="s", utc=True).isoformat(),
-        "end_time_utc": pd.to_datetime(end_time, unit="s", utc=True).isoformat(),
-        "same_candle_policy": args.same_candle_policy,
-    }
-    Path(args.config_output).write_text(
-        json.dumps(config_payload, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-
-    rankings: List[Dict[str, Any]] = []
     all_trades: List[Dict[str, Any]] = []
-    all_rejected: List[Dict[str, Any]] = []
-    all_equity: List[Dict[str, Any]] = []
     all_open: List[Dict[str, Any]] = []
+    rejection_rows: List[Dict[str, Any]] = []
+    scan_errors: List[Dict[str, Any]] = []
 
     for position, symbol in enumerate(symbols, start=1):
+        print(f"[{position}/{len(symbols)}] preparing {symbol} once for {len(variants)} variants...")
         meta = meta_map.get(symbol)
-        print(f"[{position}/{len(symbols)}] scanning {symbol}...")
-
         success = False
         for attempt in range(1, 4):
             try:
-                ranking, trades, rejected, equity, open_rows = scan_symbol(
-                    client, symbol, cfg, meta, start_time, end_time
-                )
-                rankings.append(ranking)
-                all_trades.extend(trades)
-                all_rejected.extend(rejected)
-                all_equity.extend(equity)
-                all_open.extend(open_rows)
+                simulation = prepare_symbol_data(client, symbol, cfg, start_time, end_time)
+                price_tick = meta.price_unit if meta and meta.price_unit else None
+                if price_tick is None or price_tick <= 0:
+                    price_scale = meta.price_scale if meta and meta.price_scale is not None else 8
+                    price_tick = 10.0 ** (-price_scale)
+
+                for variant in variants:
+                    trades, reject_counts, open_rows = simulate_variant(
+                        symbol, simulation, cfg, variant, price_tick
+                    )
+                    all_trades.extend(trades)
+                    all_open.extend(open_rows)
+                    for (direction, reason), count in reject_counts.items():
+                        rejection_rows.append({
+                            "variant": variant.name,
+                            "ticker": symbol,
+                            "direction": direction,
+                            "rejection_reason": reason,
+                            "count": int(count),
+                        })
                 success = True
                 break
             except Exception as exc:
                 print(f"ERROR {symbol} attempt {attempt}/3: {exc}", file=sys.stderr)
                 if attempt < 3:
                     time.sleep(3 * attempt)
-
         if not success:
-            rankings.append(
-                {
-                    "ticker": symbol,
-                    "max_leverage": meta.max_leverage if meta else None,
-                    "scan_error": True,
-                }
-            )
+            scan_errors.append({"ticker": symbol, "error": "failed after 3 attempts"})
 
-    ranking_frame = pd.DataFrame(rankings)
-    if not ranking_frame.empty:
-        ranking_frame = ranking_frame.sort_values(
-            ["profit_factor_net_r", "expectancy_net_r", "closed_trades"],
-            ascending=[False, False, False],
-            na_position="last",
-        )
-    ranking_frame.to_csv(args.ranking_output, index=False)
+    trades_frame = pd.DataFrame(all_trades)
+    period_rows = period_summary_rows(trades_frame, variants, start_time, end_time)
+    period_frame = pd.DataFrame(period_rows)
+    scorecard = build_scorecard(period_frame)
+    ticker_rows = ticker_summary_rows(trades_frame, variants, symbols)
+    eq_rows = equity_rows(trades_frame)
 
-    csv_or_empty(all_trades, ["ticker", "direction", "entry_time_utc", "exit_time_utc"], Path(args.trades_output))
-    csv_or_empty(all_rejected, ["ticker", "time_utc", "direction", "rejection_reason"], Path(args.rejected_output))
-    csv_or_empty(all_equity, ["exit_time_utc", "ticker", "pnl_r_net", "cumulative_r"], Path(args.equity_output))
-    csv_or_empty(all_open, ["ticker", "direction", "entry_time_utc"], Path(args.open_output))
-    combined_summary(all_trades).to_csv(args.summary_output, index=False)
+    prefix_name = args.output_prefix
+    outputs = {
+        "trades": Path(f"{prefix_name}_trades.csv"),
+        "period_summary": Path(f"{prefix_name}_period_summary.csv"),
+        "scorecard": Path(f"{prefix_name}_scorecard.csv"),
+        "ticker_summary": Path(f"{prefix_name}_ticker_summary.csv"),
+        "rejections": Path(f"{prefix_name}_rejections.csv"),
+        "equity": Path(f"{prefix_name}_equity.csv"),
+        "open": Path(f"{prefix_name}_open.csv"),
+        "errors": Path(f"{prefix_name}_errors.csv"),
+        "config": Path(f"{prefix_name}_config.json"),
+    }
 
-    print("\nCombined summary:")
-    print(combined_summary(all_trades).to_string(index=False))
+    csv_or_empty(all_trades, ["variant", "ticker", "direction", "entry_time_utc", "exit_time_utc"], outputs["trades"])
+    period_frame.to_csv(outputs["period_summary"], index=False)
+    scorecard.to_csv(outputs["scorecard"], index=False)
+    pd.DataFrame(ticker_rows).to_csv(outputs["ticker_summary"], index=False)
+    csv_or_empty(rejection_rows, ["variant", "ticker", "direction", "rejection_reason", "count"], outputs["rejections"])
+    csv_or_empty(eq_rows, ["variant", "exit_time_utc", "ticker", "pnl_r_net", "cumulative_r", "drawdown_r"], outputs["equity"])
+    csv_or_empty(all_open, ["variant", "ticker", "direction", "entry_time_utc"], outputs["open"])
+    csv_or_empty(scan_errors, ["ticker", "error"], outputs["errors"])
+
+    config_payload = {
+        "scanner_version": "MTF Pullback Quality v7 multi-variant",
+        "strategy_config": asdict(cfg),
+        "variants": [asdict(v) for v in variants],
+        "symbols": symbols,
+        "start_time_utc": pd.to_datetime(start_time, unit="s", utc=True).isoformat(),
+        "end_time_utc": pd.to_datetime(end_time, unit="s", utc=True).isoformat(),
+        "same_candle_policy": args.same_candle_policy,
+        "notes": "Protection stops become active on the next M1 bar after trigger; conservative intrabar assumption.",
+    }
+    outputs["config"].write_text(json.dumps(config_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    print("\n=== SCORECARD: ALL scope ===")
+    if scorecard.empty:
+        print("No closed trades.")
+    else:
+        columns = [
+            "variant", "full_trades", "full_tp", "full_sl", "full_be", "full_lock",
+            "full_pf", "full_expectancy_r", "full_net_r", "first_expectancy_r",
+            "second_expectancy_r", "both_halves_positive", "robust_score"
+        ]
+        print(scorecard.loc[scorecard["scope"] == "ALL", columns].to_string(index=False))
 
     print("\nSaved:")
-    for output in (
-        args.ranking_output,
-        args.trades_output,
-        args.rejected_output,
-        args.equity_output,
-        args.open_output,
-        args.summary_output,
-        args.config_output,
-    ):
-        print(f"  {output}")
+    for path in outputs.values():
+        print(f"  {path}")
 
 
 if __name__ == "__main__":
