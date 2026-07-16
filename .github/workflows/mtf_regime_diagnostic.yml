@@ -1,4 +1,4 @@
-name: MTF v7 Multi-Variant Test — 30D
+name: MTF v8 Robust Test — 3x30D
 
 on:
   workflow_dispatch:
@@ -9,9 +9,14 @@ jobs:
     timeout-minutes: 360
 
     # ============================================================
-    # TUTAJ ZMIENIAJ TICKERY I PODSTAWOWE PARAMETRY.
-    # BEAT_USDT celowo pominięty.
-    # Skrypt w repozytorium ma zachować nazwę mtf_regime_diagnostic.py.
+    # JEDEN SKAN:
+    # - 90 dni danych
+    # - 3 niezależne okna po 30 dni
+    # - główny kandydat: Range + Volume + Depth
+    # - BEAT_USDT celowo pominięty
+    #
+    # Skrypt w repozytorium zachowuje starą nazwę:
+    # mtf_regime_diagnostic.py
     # ============================================================
     env:
       SYMBOLS: >-
@@ -38,12 +43,15 @@ jobs:
         VTHO_USDT
         OPENAI_USDT
 
-      DAYS: "30"
+      WINDOW_DAYS: "30"
+      WINDOW_COUNT: "3"
+      WARMUP_DAYS: "7"
+
       RR: "3.0"
       COMMISSION_PERCENT: "0.06"
       SLIPPAGE_TICKS: "1"
       SAME_CANDLE_POLICY: "conservative"
-      OUTPUT_PREFIX: "v7_variants"
+      OUTPUT_PREFIX: "v8_robust"
 
     steps:
       - name: Checkout repository
@@ -54,10 +62,12 @@ jobs:
         run: |
           set -euo pipefail
           ls -lah
+
           test -f mtf_regime_diagnostic.py || {
             echo "::error::Brakuje mtf_regime_diagnostic.py w głównym katalogu repozytorium."
             exit 1
           }
+
           test -f requirements.txt || {
             echo "::error::Brakuje requirements.txt w głównym katalogu repozytorium."
             exit 1
@@ -78,16 +88,20 @@ jobs:
           python -m py_compile mtf_regime_diagnostic.py
           python mtf_regime_diagnostic.py --help
 
-      - name: Run ten strategy variants
+      - name: Run robust multi-window scanner
         shell: bash
         run: |
           set -euo pipefail
           read -r -a SYMBOL_ARRAY <<< "$SYMBOLS"
 
+          echo "Tickers: ${#SYMBOL_ARRAY[@]}"
+          echo "Windows: ${WINDOW_COUNT} x ${WINDOW_DAYS} days"
+
           python -u mtf_regime_diagnostic.py \
             --symbols "${SYMBOL_ARRAY[@]}" \
-            --days "$DAYS" \
-            --warmup-days 7 \
+            --window-days "$WINDOW_DAYS" \
+            --window-count "$WINDOW_COUNT" \
+            --warmup-days "$WARMUP_DAYS" \
             --rr "$RR" \
             --commission-percent "$COMMISSION_PERCENT" \
             --slippage-ticks "$SLIPPAGE_TICKS" \
@@ -98,17 +112,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           FILES=(
-            v7_variants_scorecard.csv
-            v7_variants_period_summary.csv
-            v7_variants_ticker_summary.csv
-            v7_variants_trades.csv
-            v7_variants_rejections.csv
-            v7_variants_equity.csv
-            v7_variants_open.csv
-            v7_variants_errors.csv
-            v7_variants_config.json
+            v8_robust_scorecard.csv
+            v8_robust_window_summary.csv
+            v8_robust_ticker_summary.csv
+            v8_robust_trades.csv
+            v8_robust_rejections.csv
+            v8_robust_equity.csv
+            v8_robust_open.csv
+            v8_robust_primary_leave_one_ticker_out.csv
+            v8_robust_errors.csv
+            v8_robust_config.json
           )
+
           for file in "${FILES[@]}"; do
             test -f "$file" || {
               echo "::error::Nie utworzono $file"
@@ -116,24 +133,33 @@ jobs:
             }
           done
 
-          echo "==== SCORECARD ===="
-          cat v7_variants_scorecard.csv
+          echo "==== PRIMARY CANDIDATE: C_RVD_CORE ===="
+          head -1 v8_robust_scorecard.csv
+          grep '^C_RVD_CORE,' v8_robust_scorecard.csv || true
+
+          echo "==== FULL SCORECARD ===="
+          cat v8_robust_scorecard.csv
+
+          echo "==== LEAVE ONE TICKER OUT ===="
+          cat v8_robust_primary_leave_one_ticker_out.csv
 
       - name: Add run summary
         if: always()
         shell: bash
         run: |
           {
-            echo "## MTF v7 — multi-variant 30-day test"
+            echo "## MTF v8 — robust 3x30-day test"
             echo ""
-            echo "- Days: \`$DAYS\`"
+            echo "- Windows: \`${WINDOW_COUNT} x ${WINDOW_DAYS} days\`"
             echo "- RR: \`$RR\`"
-            echo "- Variants: baseline, isolated filters, all filters, LONG/SHORT only, BE and lock"
+            echo "- Primary: \`C_RVD_CORE\`"
+            echo "- Primary filters: M1 range >= 1.10, M5 volume <= 0.90, M5 depth <= 1.70 ATR"
             echo ""
-            if [[ -f v7_variants_scorecard.csv ]]; then
-              echo "### Scorecard"
+            if [[ -f v8_robust_scorecard.csv ]]; then
+              echo "### Primary candidate"
               echo '```csv'
-              head -35 v7_variants_scorecard.csv
+              head -1 v8_robust_scorecard.csv
+              grep '^C_RVD_CORE,' v8_robust_scorecard.csv || true
               echo '```'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
@@ -142,16 +168,17 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mtf-v7-variants-30d-${{ github.run_id }}
+          name: mtf-v8-robust-3x30d-${{ github.run_id }}
           retention-days: 30
           if-no-files-found: warn
           path: |
-            v7_variants_scorecard.csv
-            v7_variants_period_summary.csv
-            v7_variants_ticker_summary.csv
-            v7_variants_trades.csv
-            v7_variants_rejections.csv
-            v7_variants_equity.csv
-            v7_variants_open.csv
-            v7_variants_errors.csv
-            v7_variants_config.json
+            v8_robust_scorecard.csv
+            v8_robust_window_summary.csv
+            v8_robust_ticker_summary.csv
+            v8_robust_trades.csv
+            v8_robust_rejections.csv
+            v8_robust_equity.csv
+            v8_robust_open.csv
+            v8_robust_primary_leave_one_ticker_out.csv
+            v8_robust_errors.csv
+            v8_robust_config.json
