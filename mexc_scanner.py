@@ -1,174 +1,205 @@
+#!/usr/bin/env python3
+"""
+MEXC futures scanner matching the Pine:
+"Analiza 3xSL - 5R - margin dynamiczny + taker fee"
+
+Main rules reproduced:
+- SMA 12 / 50 / 200
+- Heikin Ashi calculated from normal OHLC
+- Entry MA200_UP / MA200_DOWN
+- Entry price = signal candle high for LONG, low for SHORT
+- SL1 = MA50 on entry candle
+- Entry rejected when SL1 ROI > max_sl1_roi_percent
+- TP = tp_r * initial risk
+- SL2 activated after MA12/MA200 signal
+- SL3 activated after MA50/MA200 signal
+- Conservative same-candle handling: SL wins over TP
+- Dynamic margin = current capital * margin_multiplier / leverage
+- Taker fee charged on entry and exit
+- Capital compounded trade by trade
+"""
+
+from __future__ import annotations
+
 import argparse
+import math
 import time
-from dataclasses import dataclass, asdict
-from typing import List, Optional, Dict, Any, Tuple
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 import requests
 
-BASE_URL = "https://api.mexc.com"
+BASE_URL = "https://contract.mexc.com"
+DEFAULT_TIMEOUT = 30
+EPSILON = 1e-10
+
+INTERVAL_SECONDS: Dict[str, int] = {
+    "Min1": 60,
+    "Min5": 5 * 60,
+    "Min15": 15 * 60,
+    "Min30": 30 * 60,
+    "Min60": 60 * 60,
+    "Hour4": 4 * 60 * 60,
+    "Hour8": 8 * 60 * 60,
+    "Day1": 24 * 60 * 60,
+}
 
 
 @dataclass
 class ScanConfig:
-    tp_percent: float = 7.0
-    cooldown_minutes: int = 720
+    interval: str = "Min1"
+    days: int = 7
+    tp_r: float = 5.0
+    max_sl1_roi_percent: float = 50.0
+    leverage: float = 50.0
+    taker_fee: float = 0.0008
+    margin_multiplier: float = 10.0
+    starting_capital: float = 5.0
+    cooldown_minutes: int = 0
     conservative_same_candle: bool = True
     check_result_on_entry_bar: bool = False
-    days: int = 14
 
 
 @dataclass
 class ContractMeta:
     ticker: str
     max_leverage: Optional[int] = None
-    base_coin: Optional[str] = None
     quote_coin: Optional[str] = None
-    contract_size: Optional[float] = None
-    min_vol: Optional[float] = None
-    price_scale: Optional[int] = None
-    amount_scale: Optional[int] = None
+    state: Optional[int] = None
+    api_allowed: bool = True
 
 
 @dataclass
 class ScanResult:
     ticker: str
+    timeframe: str
     max_leverage: Optional[int]
+    raw_signals: int
     entries: int
+    closed_trades: int
+    open_trade_at_end: bool
+    skipped_cooldown: int
+    skipped_in_trade: int
+    skipped_sl_too_large: int
     tp: int
     sl: int
-    wr: Optional[float]
-    sl_rate: Optional[float]
     sl1: int
     sl2: int
     sl3: int
-    ma200_raw: int
-    skipped_cooldown: int
-    skipped_in_trade: int
-    avg_trade_pnl_pct: Optional[float]
-    avg_tp_pnl_pct: Optional[float]
-    avg_sl_pnl_pct: Optional[float]
-    avg_sl1_pnl_pct: Optional[float]
-    avg_sl2_pnl_pct: Optional[float]
-    avg_sl3_pnl_pct: Optional[float]
-    sum_profit_pct: Optional[float]
-    sum_loss_pct_abs: Optional[float]
+    win_rate_pct: Optional[float]
+    net_r: float
+    expectancy_r: Optional[float]
+    avg_sl1_price_pct: Optional[float]
+    median_sl1_price_pct: Optional[float]
+    max_sl1_price_pct: Optional[float]
+    avg_sl1_roi_pct: Optional[float]
+    median_sl1_roi_pct: Optional[float]
+    max_sl1_roi_pct: Optional[float]
+    avg_tp_roi_pct: Optional[float]
+    median_tp_roi_pct: Optional[float]
+    max_tp_roi_pct: Optional[float]
+    gross_profit_usdt: float
+    gross_loss_usdt: float
+    total_fees_usdt: float
     profit_factor: Optional[float]
-    expectancy_pct: Optional[float]
-    avg_ma50_distance_entry_pct: Optional[float]
-    avg_ma50_distance_sl1_pct: Optional[float]
+    expectancy_roi_pct: Optional[float]
+    starting_capital_usdt: float
+    ending_capital_usdt: float
+    highest_capital_usdt: float
+    return_on_capital_pct: float
+    max_drawdown_pct: float
+    longest_win_streak: int
+    longest_loss_streak: int
+    current_streak: str
     sequence_last_30: str
-    max_losing_streak: int
-    max_winning_streak: int
     score: Optional[float]
 
 
-def mexc_get(path: str, params: Optional[dict] = None, retries: int = 3, backoff: float = 2.0) -> dict:
+def mexc_get(
+    path: str,
+    params: Optional[dict] = None,
+    retries: int = 4,
+    backoff: float = 1.5,
+) -> dict:
     url = f"{BASE_URL}{path}"
-    last_error = None
+    last_error: Optional[Exception] = None
 
     for attempt in range(1, retries + 1):
         try:
-            r = requests.get(url, params=params, timeout=25)
-            r.raise_for_status()
-            data = r.json()
-            if data.get("success") is False:
-                raise RuntimeError(f"MEXC error: {data}")
-            return data
-        except Exception as e:
-            last_error = e
-            print(f"MEXC request error attempt {attempt}/{retries}: {path} {params} -> {e}")
+            response = requests.get(url, params=params, timeout=DEFAULT_TIMEOUT)
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("success") is False:
+                raise RuntimeError(f"MEXC API error: {payload}")
+            return payload
+        except Exception as exc:
+            last_error = exc
+            print(f"Request error {attempt}/{retries}: {url} {params} -> {exc}", flush=True)
             if attempt < retries:
                 time.sleep(backoff * attempt)
 
+    assert last_error is not None
     raise last_error
 
 
-def _to_int(value: Any) -> Optional[int]:
-    if value is None or value == "":
-        return None
+def to_int(value: Any) -> Optional[int]:
     try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return None
-
-
-def _to_float(value: Any) -> Optional[float]:
-    if value is None or value == "":
-        return None
-    try:
-        return float(value)
+        return int(float(value)) if value not in (None, "") else None
     except (TypeError, ValueError):
         return None
 
 
 def extract_max_leverage(row: Dict[str, Any]) -> Optional[int]:
-    candidates = [
+    candidates = (
         row.get("maxLeverage"),
         row.get("max_leverage"),
         row.get("maxLever"),
         row.get("leverageMax"),
         row.get("maxLongLeverage"),
         row.get("maxShortLeverage"),
-    ]
-    values = [_to_int(x) for x in candidates]
-    values = [x for x in values if x is not None]
-    return max(values) if values else None
+    )
+    values = [to_int(value) for value in candidates]
+    valid = [value for value in values if value is not None]
+    return max(valid) if valid else None
 
 
 def get_contract_meta() -> Dict[str, ContractMeta]:
-    data = mexc_get("/api/v1/contract/detail")
-    rows = data.get("data", [])
-    meta: Dict[str, ContractMeta] = {}
+    rows = mexc_get("/api/v1/contract/detail").get("data", [])
+    result: Dict[str, ContractMeta] = {}
 
     for row in rows:
         symbol = row.get("symbol")
         if not symbol:
             continue
-
-        meta[symbol] = ContractMeta(
+        result[symbol] = ContractMeta(
             ticker=symbol,
             max_leverage=extract_max_leverage(row),
-            base_coin=row.get("baseCoin"),
             quote_coin=row.get("quoteCoin"),
-            contract_size=_to_float(row.get("contractSize")),
-            min_vol=_to_float(row.get("minVol")),
-            price_scale=_to_int(row.get("priceScale")),
-            amount_scale=_to_int(row.get("amountScale")),
+            state=to_int(row.get("state")),
+            api_allowed=bool(row.get("apiAllowed", True)),
         )
 
-    return meta
+    return result
 
 
 def get_contract_symbols(
-    limit: Optional[int] = None,
-    min_max_leverage: Optional[int] = None,
-    meta: Optional[Dict[str, ContractMeta]] = None,
+    meta_map: Dict[str, ContractMeta],
+    min_max_leverage: Optional[int],
+    limit: Optional[int],
 ) -> List[str]:
-    data = mexc_get("/api/v1/contract/detail")
-    rows = data.get("data", [])
-    symbols = []
+    symbols: List[str] = []
 
-    if meta is None:
-        meta = get_contract_meta()
-
-    for row in rows:
-        symbol = row.get("symbol")
-        if not symbol:
+    for symbol, meta in meta_map.items():
+        if meta.quote_coin != "USDT":
             continue
-
-        is_enabled = row.get("state") == 0
-        is_usdt = row.get("quoteCoin") == "USDT"
-        api_allowed = row.get("apiAllowed", True)
-        max_lev = meta.get(symbol, ContractMeta(symbol)).max_leverage
-
-        if not (is_enabled and is_usdt and api_allowed):
+        if meta.state != 0:
             continue
-
+        if not meta.api_allowed:
+            continue
         if min_max_leverage is not None:
-            if max_lev is None or max_lev < min_max_leverage:
+            if meta.max_leverage is None or meta.max_leverage < min_max_leverage:
                 continue
-
         symbols.append(symbol)
 
     symbols = sorted(set(symbols))
@@ -176,80 +207,88 @@ def get_contract_symbols(
 
 
 def fetch_klines(symbol: str, interval: str, start: int, end: int) -> pd.DataFrame:
-    step_seconds = 60 if interval == "Min1" else 15 * 60
-    max_points = 2000
-    chunk = step_seconds * max_points
-    frames = []
+    if interval not in INTERVAL_SECONDS:
+        raise ValueError(f"Unsupported interval: {interval}. Choose from: {', '.join(INTERVAL_SECONDS)}")
+
+    step = INTERVAL_SECONDS[interval]
+    max_points = 1900
+    chunk_span = step * max_points
     cursor = start
+    frames: List[pd.DataFrame] = []
 
     while cursor < end:
-        chunk_end = min(end, cursor + chunk - step_seconds)
-        data = mexc_get(
+        chunk_end = min(end, cursor + chunk_span - step)
+        payload = mexc_get(
             f"/api/v1/contract/kline/{symbol}",
             {"interval": interval, "start": cursor, "end": chunk_end},
         ).get("data", {})
 
-        if not data or not data.get("time"):
-            cursor = chunk_end + step_seconds
-            continue
+        times = payload.get("time") if payload else None
+        if times:
+            size = len(times)
+            frame = pd.DataFrame(
+                {
+                    "time": times,
+                    "open": payload.get("open", [None] * size),
+                    "high": payload.get("high", [None] * size),
+                    "low": payload.get("low", [None] * size),
+                    "close": payload.get("close", [None] * size),
+                    "vol": payload.get("vol", [None] * size),
+                }
+            )
+            frames.append(frame)
 
-        df = pd.DataFrame(
-            {
-                "time": data["time"],
-                "open": data["open"],
-                "high": data["high"],
-                "low": data["low"],
-                "close": data["close"],
-                "vol": data.get("vol", [None] * len(data["time"])),
-            }
-        )
-        frames.append(df)
-        cursor = chunk_end + step_seconds
-        time.sleep(0.06)
+        cursor = chunk_end + step
+        time.sleep(0.05)
 
     if not frames:
         return pd.DataFrame(columns=["time", "open", "high", "low", "close", "vol"])
 
-    out = pd.concat(frames, ignore_index=True)
-    out = out.drop_duplicates("time").sort_values("time")
-    for col in ["open", "high", "low", "close", "vol"]:
-        out[col] = pd.to_numeric(out[col], errors="coerce")
-    return out.reset_index(drop=True)
+    df = pd.concat(frames, ignore_index=True)
+    df = df.drop_duplicates("time").sort_values("time").reset_index(drop=True)
+
+    for column in ("time", "open", "high", "low", "close", "vol"):
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+
+    return df.dropna(subset=["time", "open", "high", "low", "close"]).reset_index(drop=True)
 
 
-def crossover(a_prev, a, b_prev, b) -> bool:
-    return a_prev <= b_prev and a > b
+def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["dt"] = pd.to_datetime(out["time"], unit="s", utc=True)
+    out["ma12"] = out["close"].rolling(12).mean()
+    out["ma50"] = out["close"].rolling(50).mean()
+    out["ma200"] = out["close"].rolling(200).mean()
+    out["ha_close"] = (out["open"] + out["high"] + out["low"] + out["close"]) / 4.0
 
-
-def crossunder(a_prev, a, b_prev, b) -> bool:
-    return a_prev >= b_prev and a < b
-
-
-def prepare_data(df1: pd.DataFrame) -> pd.DataFrame:
-    df = df1.copy()
-    df["dt"] = pd.to_datetime(df["time"], unit="s", utc=True)
-
-    df["ma12"] = df["close"].rolling(12).mean()
-    df["ma50"] = df["close"].rolling(50).mean()
-    df["ma200"] = df["close"].rolling(200).mean()
-
-    ha_close = (df["open"] + df["high"] + df["low"] + df["close"]) / 4
-    ha_open = []
-    for i, row in df.iterrows():
+    ha_open: List[float] = []
+    for i, row in out.iterrows():
         if i == 0:
-            ha_open.append((row["open"] + row["close"]) / 2)
+            value = (float(row["open"]) + float(row["close"])) / 2.0
         else:
-            ha_open.append((ha_open[i - 1] + ha_close.iloc[i - 1]) / 2)
+            value = (ha_open[i - 1] + float(out.iloc[i - 1]["ha_close"])) / 2.0
+        ha_open.append(value)
 
-    df["ha_close"] = ha_close
-    df["ha_open"] = ha_open
-    df["ha_high"] = df[["high", "ha_open", "ha_close"]].max(axis=1)
-    df["ha_low"] = df[["low", "ha_open", "ha_close"]].min(axis=1)
-
-    return df.reset_index(drop=True)
+    out["ha_open"] = ha_open
+    out["ha_high"] = out[["high", "ha_open", "ha_close"]].max(axis=1)
+    out["ha_low"] = out[["low", "ha_open", "ha_close"]].min(axis=1)
+    return out
 
 
-def reset_trade_state() -> Dict[str, Any]:
+def crossover(a_prev: float, a_now: float, b_prev: float, b_now: float) -> bool:
+    return a_prev <= b_prev and a_now > b_now
+
+
+def crossunder(a_prev: float, a_now: float, b_prev: float, b_now: float) -> bool:
+    return a_prev >= b_prev and a_now < b_now
+
+
+def approx_equal(a: float, b: float) -> bool:
+    tolerance = EPSILON * max(1.0, abs(a), abs(b))
+    return abs(a - b) <= tolerance
+
+
+def empty_state() -> Dict[str, Any]:
     return {
         "in_trade": False,
         "direction": 0,
@@ -257,403 +296,644 @@ def reset_trade_state() -> Dict[str, Any]:
         "entry_time": None,
         "entry_price": None,
         "tp_price": None,
+        "initial_risk": None,
+        "initial_sl1_price_pct": None,
+        "initial_sl1_roi_pct": None,
         "sl1_price": None,
         "sl2_price": None,
         "sl2_active": False,
         "sl3_price": None,
         "sl3_active": False,
+        "margin": None,
+        "capital_before": None,
     }
 
 
-def streaks(seq: List[str]) -> Tuple[int, int]:
-    max_loss = 0
-    max_win = 0
-    cur_loss = 0
-    cur_win = 0
-    for x in seq:
-        if x == "SL":
-            cur_loss += 1
-            cur_win = 0
-        elif x == "TP":
-            cur_win += 1
-            cur_loss = 0
-        max_loss = max(max_loss, cur_loss)
-        max_win = max(max_win, cur_win)
-    return max_loss, max_win
+def calculate_streaks(sequence: Iterable[str]) -> Tuple[int, int, str]:
+    current_win = 0
+    current_loss = 0
+    longest_win = 0
+    longest_loss = 0
+    current_text = "-"
+
+    for item in sequence:
+        if item == "TP":
+            current_win += 1
+            current_loss = 0
+            longest_win = max(longest_win, current_win)
+            current_text = f"W{current_win}"
+        else:
+            current_loss += 1
+            current_win = 0
+            longest_loss = max(longest_loss, current_loss)
+            current_text = f"L{current_loss}"
+
+    return longest_win, longest_loss, current_text
 
 
-def scan_symbol(symbol: str, cfg: ScanConfig, meta: Optional[ContractMeta] = None) -> Tuple[ScanResult, List[Dict[str, Any]]]:
+def safe_mean(values: List[float]) -> Optional[float]:
+    return float(sum(values) / len(values)) if values else None
+
+
+def safe_median(values: List[float]) -> Optional[float]:
+    return float(pd.Series(values).median()) if values else None
+
+
+def safe_max(values: List[float]) -> Optional[float]:
+    return float(max(values)) if values else None
+
+
+def scan_symbol(
+    symbol: str,
+    cfg: ScanConfig,
+    meta: Optional[ContractMeta],
+) -> Tuple[ScanResult, List[Dict[str, Any]]]:
     end = int(time.time())
-    start = end - cfg.days * 24 * 60 * 60
-    warmup_start = start - 30 * 24 * 60 * 60
+    requested_start = end - cfg.days * 24 * 60 * 60
 
-    df1 = fetch_klines(symbol, "Min1", warmup_start, end)
+    # Enough warm-up for MA200 and HA recursion on every supported timeframe.
+    warmup_bars = 500
+    warmup_start = requested_start - warmup_bars * INTERVAL_SECONDS[cfg.interval]
+
+    raw_df = fetch_klines(symbol, cfg.interval, warmup_start, end)
     max_leverage = meta.max_leverage if meta else None
 
-    if len(df1) < 250:
-        empty_result = ScanResult(
-            symbol, max_leverage, 0, 0, 0, None, None, 0, 0, 0, 0, 0, 0,
-            None, None, None, None, None, None, None, None, None, None, None, None,
-            "", 0, 0, None
-        )
-        return empty_result, []
+    if len(raw_df) < 220:
+        return build_empty_result(symbol, cfg, max_leverage), []
 
-    df = prepare_data(df1)
-    df = df[df["time"] >= start].reset_index(drop=True)
+    df = prepare_data(raw_df)
+    start_positions = df.index[df["time"] >= requested_start].tolist()
+    if not start_positions:
+        return build_empty_result(symbol, cfg, max_leverage), []
 
-    state = reset_trade_state()
-    last_entry_time = None
-    total = tp = sl = sl1 = sl2 = sl3 = 0
-    ma200_raw = skipped_cooldown = skipped_in_trade = 0
-    seq: List[str] = []
-    debug_trades: List[Dict[str, Any]] = []
-    trade_metric_rows: List[Dict[str, Any]] = []
+    first_scan_i = max(1, start_positions[0])
+
+    state = empty_state()
+    last_entry_time: Optional[int] = None
     cooldown_seconds = cfg.cooldown_minutes * 60
 
-    for i in range(1, len(df)):
-        r = df.iloc[i]
-        p = df.iloc[i - 1]
-        needed = [r.ma12, r.ma50, r.ma200, p.ma12, p.ma50, p.ma200]
-        if any(pd.isna(x) for x in needed):
+    raw_signals = 0
+    entries = 0
+    skipped_cooldown = 0
+    skipped_in_trade = 0
+    skipped_sl_too_large = 0
+    tp_count = 0
+    sl_count = 0
+    sl1_count = 0
+    sl2_count = 0
+    sl3_count = 0
+
+    capital = cfg.starting_capital
+    highest_capital = cfg.starting_capital
+    max_drawdown_pct = 0.0
+    gross_profit = 0.0
+    gross_loss = 0.0
+    total_fees = 0.0
+    total_margin_used = 0.0
+    net_r = 0.0
+
+    sl1_price_pcts: List[float] = []
+    sl1_roi_pcts: List[float] = []
+    tp_roi_pcts: List[float] = []
+    sequence: List[str] = []
+    debug_rows: List[Dict[str, Any]] = []
+
+    for i in range(first_scan_i, len(df)):
+        row = df.iloc[i]
+        prev = df.iloc[i - 1]
+
+        needed = (
+            row["ma12"], row["ma50"], row["ma200"],
+            prev["ma12"], prev["ma50"], prev["ma200"],
+            row["ha_close"], row["ha_open"], prev["ha_close"],
+        )
+        if any(pd.isna(value) for value in needed):
             continue
 
-        ha_green = r.ha_close > r.ha_open
-        ha_red = r.ha_close < r.ha_open
-        ha_no_lower = abs(r.ha_low - min(r.ha_open, r.ha_close)) < 1e-12
-        ha_no_upper = abs(r.ha_high - max(r.ha_open, r.ha_close)) < 1e-12
+        cross_ma12_up = crossover(prev["ma12"], row["ma12"], prev["ma200"], row["ma200"])
+        cross_ma12_down = crossunder(prev["ma12"], row["ma12"], prev["ma200"], row["ma200"])
+        cross_ma50_up = crossover(prev["ma50"], row["ma50"], prev["ma200"], row["ma200"])
+        cross_ma50_down = crossunder(prev["ma50"], row["ma50"], prev["ma200"], row["ma200"])
+        cross_ha_up = crossover(prev["ha_close"], row["ha_close"], prev["ma200"], row["ma200"])
+        cross_ha_down = crossunder(prev["ha_close"], row["ha_close"], prev["ma200"], row["ma200"])
 
+        ha_green = row["ha_close"] > row["ha_open"]
+        ha_red = row["ha_close"] < row["ha_open"]
+        ha_no_lower = approx_equal(row["ha_low"], min(row["ha_open"], row["ha_close"]))
+        ha_no_upper = approx_equal(row["ha_high"], max(row["ha_open"], row["ha_close"]))
 
-        cross_ma12_up = crossover(p.ma12, r.ma12, p.ma200, r.ma200)
-        cross_ma12_down = crossunder(p.ma12, r.ma12, p.ma200, r.ma200)
-        cross_ma50_up = crossover(p.ma50, r.ma50, p.ma200, r.ma200)
-        cross_ma50_down = crossunder(p.ma50, r.ma50, p.ma200, r.ma200)
-        cross_ha_up = crossover(p.ha_close, r.ha_close, p.ma200, r.ma200)
-        cross_ha_down = crossunder(p.ha_close, r.ha_close, p.ma200, r.ma200)
+        long_signal = cross_ma12_up and row["ma50"] < row["ma12"] and row["ma50"] < row["ma200"]
+        short_signal = cross_ma12_down and row["ma50"] > row["ma12"] and row["ma50"] > row["ma200"]
 
-        long_signal = cross_ma12_up and r.ma50 < r.ma12 and r.ma50 < r.ma200
-        short_signal = cross_ma12_down and r.ma50 > r.ma12 and r.ma50 > r.ma200
-
-        ma50_up = cross_ma50_up and r.ma12 > r.ma50 and r.ma12 > r.ma200
-        ma50_down = cross_ma50_down and r.ma12 < r.ma50 and r.ma12 < r.ma200
+        ma50_up = cross_ma50_up and row["ma12"] > row["ma50"] and row["ma12"] > row["ma200"]
+        ma50_down = cross_ma50_down and row["ma12"] < row["ma50"] and row["ma12"] < row["ma200"]
 
         ma200_up_raw = (
             ha_green
             and ha_no_lower
             and cross_ha_up
-            and r.ma50 < r.ma12
-            and r.ma12 < r.ma200
+            and row["ma50"] < row["ma12"]
+            and row["ma12"] < row["ma200"]
         )
         ma200_down_raw = (
             ha_red
             and ha_no_upper
             and cross_ha_down
-            and r.ma50 > r.ma12
-            and r.ma12 > r.ma200
+            and row["ma50"] > row["ma12"]
+            and row["ma12"] > row["ma200"]
         )
+        raw_signal = ma200_up_raw or ma200_down_raw
 
-        ma200_raw_signal = ma200_up_raw or ma200_down_raw
-        cooldown_ok = last_entry_time is None or (int(r.time) - last_entry_time) >= cooldown_seconds
+        row_time = int(row["time"])
+        cooldown_ok = last_entry_time is None or row_time - last_entry_time >= cooldown_seconds
 
-        if ma200_raw_signal:
-            ma200_raw += 1
+        if raw_signal:
+            raw_signals += 1
             if not cooldown_ok:
                 skipped_cooldown += 1
             if cooldown_ok and state["in_trade"]:
                 skipped_in_trade += 1
 
-        ma200_up = ma200_up_raw and cooldown_ok and not state["in_trade"]
-        ma200_down = ma200_down_raw and cooldown_ok and not state["in_trade"]
+        long_entry = float(row["high"])
+        long_sl1 = float(row["ma50"])
+        long_risk = long_entry - long_sl1
+        long_sl1_price_pct = long_risk / long_entry * 100.0 if long_risk > 0 else math.nan
+        long_sl1_roi_pct = long_sl1_price_pct * cfg.leverage if not math.isnan(long_sl1_price_pct) else math.nan
+        long_valid = long_risk > 0 and long_sl1_roi_pct <= cfg.max_sl1_roi_percent
 
-        if ma200_up:
-            state["in_trade"] = True
-            state["direction"] = 1
-            state["entry_i"] = i
-            state["entry_time"] = int(r.time)
-            state["entry_price"] = r.high
-            state["tp_price"] = state["entry_price"] * (1 + cfg.tp_percent / 100)
-            state["sl1_price"] = r.ma50
-            state["sl2_price"] = r.ha_low
-            state["sl2_active"] = False
-            state["sl3_price"] = None
-            state["sl3_active"] = False
-            total += 1
-            last_entry_time = int(r.time)
+        short_entry = float(row["low"])
+        short_sl1 = float(row["ma50"])
+        short_risk = short_sl1 - short_entry
+        short_sl1_price_pct = short_risk / short_entry * 100.0 if short_risk > 0 else math.nan
+        short_sl1_roi_pct = short_sl1_price_pct * cfg.leverage if not math.isnan(short_sl1_price_pct) else math.nan
+        short_valid = short_risk > 0 and short_sl1_roi_pct <= cfg.max_sl1_roi_percent
 
-        elif ma200_down:
-            state["in_trade"] = True
-            state["direction"] = -1
-            state["entry_i"] = i
-            state["entry_time"] = int(r.time)
-            state["entry_price"] = r.low
-            state["tp_price"] = state["entry_price"] * (1 - cfg.tp_percent / 100)
-            state["sl1_price"] = r.ma50
-            state["sl2_price"] = r.ha_high
-            state["sl2_active"] = False
-            state["sl3_price"] = None
-            state["sl3_active"] = False
-            total += 1
-            last_entry_time = int(r.time)
+        if ma200_up_raw and cooldown_ok and not state["in_trade"] and not long_valid:
+            skipped_sl_too_large += 1
+        if ma200_down_raw and cooldown_ok and not state["in_trade"] and not short_valid:
+            skipped_sl_too_large += 1
 
+        ma200_up = ma200_up_raw and cooldown_ok and not state["in_trade"] and long_valid
+        ma200_down = ma200_down_raw and cooldown_ok and not state["in_trade"] and short_valid
+
+        if ma200_up or ma200_down:
+            direction = 1 if ma200_up else -1
+            entry_price = long_entry if direction == 1 else short_entry
+            sl1_price = long_sl1 if direction == 1 else short_sl1
+            initial_risk = long_risk if direction == 1 else short_risk
+            sl1_price_pct = long_sl1_price_pct if direction == 1 else short_sl1_price_pct
+            sl1_roi_pct = long_sl1_roi_pct if direction == 1 else short_sl1_roi_pct
+            tp_price = (
+                entry_price + initial_risk * cfg.tp_r
+                if direction == 1
+                else entry_price - initial_risk * cfg.tp_r
+            )
+            margin = capital * cfg.margin_multiplier / cfg.leverage
+
+            state = {
+                "in_trade": True,
+                "direction": direction,
+                "entry_i": i,
+                "entry_time": row_time,
+                "entry_price": entry_price,
+                "tp_price": tp_price,
+                "initial_risk": initial_risk,
+                "initial_sl1_price_pct": sl1_price_pct,
+                "initial_sl1_roi_pct": sl1_roi_pct,
+                "sl1_price": sl1_price,
+                "sl2_price": float(row["ha_low"] if direction == 1 else row["ha_high"]),
+                "sl2_active": False,
+                "sl3_price": None,
+                "sl3_active": False,
+                "margin": margin,
+                "capital_before": capital,
+            }
+            entries += 1
+            total_margin_used += margin
+            sl1_price_pcts.append(sl1_price_pct)
+            sl1_roi_pcts.append(sl1_roi_pct)
+            tp_roi_pcts.append(sl1_roi_pct * cfg.tp_r)
+            last_entry_time = row_time
+
+        # Pine evaluates these blocks after entry blocks on the same candle.
         if state["in_trade"] and state["direction"] == 1 and long_signal and not state["sl2_active"]:
             state["sl2_active"] = True
         if state["in_trade"] and state["direction"] == -1 and short_signal and not state["sl2_active"]:
             state["sl2_active"] = True
         if state["in_trade"] and state["direction"] == 1 and ma50_up and not state["sl3_active"]:
-            state["sl3_price"] = r.ma50
+            state["sl3_price"] = float(row["ma50"])
             state["sl3_active"] = True
         if state["in_trade"] and state["direction"] == -1 and ma50_down and not state["sl3_active"]:
-            state["sl3_price"] = r.ma50
+            state["sl3_price"] = float(row["ma50"])
             state["sl3_active"] = True
 
-        can_check = state["in_trade"] and (cfg.check_result_on_entry_bar or i > state["entry_i"])
+        can_check = state["in_trade"] and (
+            cfg.check_result_on_entry_bar or i > int(state["entry_i"])
+        )
         if not can_check:
             continue
 
-        direction = state["direction"]
-        tp_hit = (direction == 1 and r.high >= state["tp_price"]) or (direction == -1 and r.low <= state["tp_price"])
-        sl1_hit = (direction == 1 and r.low <= state["sl1_price"]) or (direction == -1 and r.high >= state["sl1_price"])
-        sl2_hit = state["sl2_active"] and ((direction == 1 and r.low <= state["sl2_price"]) or (direction == -1 and r.high >= state["sl2_price"]))
-        sl3_hit = state["sl3_active"] and ((direction == 1 and r.low <= state["sl3_price"]) or (direction == -1 and r.high >= state["sl3_price"]))
-        sl_hit = sl1_hit or sl2_hit or sl3_hit
+        direction = int(state["direction"])
+        tp_hit = (
+            direction == 1 and row["high"] >= state["tp_price"]
+        ) or (
+            direction == -1 and row["low"] <= state["tp_price"]
+        )
+        sl1_hit = (
+            direction == 1 and row["low"] <= state["sl1_price"]
+        ) or (
+            direction == -1 and row["high"] >= state["sl1_price"]
+        )
+        sl2_hit = bool(state["sl2_active"]) and (
+            (direction == 1 and row["low"] <= state["sl2_price"])
+            or (direction == -1 and row["high"] >= state["sl2_price"])
+        )
+        sl3_hit = bool(state["sl3_active"]) and (
+            (direction == 1 and row["low"] <= state["sl3_price"])
+            or (direction == -1 and row["high"] >= state["sl3_price"])
+        )
 
+        sl_hit = sl1_hit or sl2_hit or sl3_hit
         result_sl = sl_hit and (cfg.conservative_same_candle or not tp_hit)
         result_tp = tp_hit and not result_sl
 
-        if result_tp or result_sl:
-            result = "TP" if result_tp else "SL"
+        if not (result_tp or result_sl):
+            continue
+
+        if result_tp:
+            result = "TP"
             sl_type = ""
-            if result_sl:
-                if sl1_hit:
-                    sl_type = "SL1 MA50 entry"
-                elif sl2_hit:
-                    sl_type = "SL2 HA flat"
-                elif sl3_hit:
-                    sl_type = "SL3 MA50 cross"
-
-            if result_tp:
-                exit_price = state["tp_price"]
-            elif sl1_hit:
-                exit_price = state["sl1_price"]
+            exit_price = float(state["tp_price"])
+            tp_count += 1
+        else:
+            result = "SL"
+            sl_count += 1
+            if sl1_hit:
+                sl_type = "SL1 MA50 entry"
+                exit_price = float(state["sl1_price"])
+                sl1_count += 1
             elif sl2_hit:
-                exit_price = state["sl2_price"]
-            elif sl3_hit:
-                exit_price = state["sl3_price"]
+                sl_type = "SL2 HA flat"
+                exit_price = float(state["sl2_price"])
+                sl2_count += 1
             else:
-                exit_price = r.close
+                sl_type = "SL3 MA50 cross"
+                exit_price = float(state["sl3_price"])
+                sl3_count += 1
 
-            if direction == 1:
-                pnl_pct = (exit_price - state["entry_price"]) / state["entry_price"] * 100
-            else:
-                pnl_pct = (state["entry_price"] - exit_price) / state["entry_price"] * 100
+        entry_price = float(state["entry_price"])
+        initial_risk = float(state["initial_risk"])
+        trade_r = (
+            (exit_price - entry_price) / initial_risk
+            if direction == 1
+            else (entry_price - exit_price) / initial_risk
+        )
+        trade_price_pct = (
+            (exit_price - entry_price) / entry_price * 100.0
+            if direction == 1
+            else (entry_price - exit_price) / entry_price * 100.0
+        )
+        trade_roi_pct = trade_price_pct * cfg.leverage
+        margin = float(state["margin"])
+        position_value = margin * cfg.leverage
+        fee = position_value * cfg.taker_fee * 2.0
+        pnl_gross = margin * trade_roi_pct / 100.0
+        pnl_net = pnl_gross - fee
 
-            ma50_distance_entry_pct = abs(state["entry_price"] - state["sl1_price"]) / state["entry_price"] * 100
+        net_r += trade_r
+        total_fees += fee
+        if pnl_net >= 0:
+            gross_profit += pnl_net
+        else:
+            gross_loss += abs(pnl_net)
 
-            trade_metric_rows.append({"result": result, "sl_type": sl_type, "pnl_pct": pnl_pct, "ma50_distance_entry_pct": ma50_distance_entry_pct})
-            debug_trades.append(
-                {
-                    "ticker": symbol,
-                    "max_leverage": max_leverage,
-                    "entry_time_utc": pd.to_datetime(state["entry_time"], unit="s", utc=True),
-                    "exit_time_utc": pd.to_datetime(int(r.time), unit="s", utc=True),
-                    "direction": "LONG" if direction == 1 else "SHORT",
-                    "entry_price": state["entry_price"],
-                    "exit_price": exit_price,
-                    "pnl_pct": pnl_pct,
-                    "ma50_distance_entry_pct": ma50_distance_entry_pct,
-                    "exit_candle_open": r.open,
-                    "exit_candle_high": r.high,
-                    "exit_candle_low": r.low,
-                    "exit_candle_close": r.close,
-                    "result": result,
-                    "sl_type": sl_type,
-                    "tp_price": state["tp_price"],
-                    "sl1_price": state["sl1_price"],
-                    "sl2_price": state["sl2_price"],
-                    "sl2_active_at_exit": state["sl2_active"],
-                    "sl3_price": state["sl3_price"],
-                    "sl3_active_at_exit": state["sl3_active"],
-                    "tp_hit": tp_hit,
-                    "sl1_hit": sl1_hit,
-                    "sl2_hit": sl2_hit,
-                    "sl3_hit": sl3_hit,
-                }
-            )
+        capital += pnl_net
+        highest_capital = max(highest_capital, capital)
+        drawdown_pct = (
+            (capital - highest_capital) / highest_capital * 100.0
+            if highest_capital > 0
+            else 0.0
+        )
+        max_drawdown_pct = min(max_drawdown_pct, drawdown_pct)
+        sequence.append(result)
 
-            if result_tp:
-                tp += 1
-                seq.append("TP")
-            else:
-                sl += 1
-                seq.append("SL")
-                if sl1_hit:
-                    sl1 += 1
-                elif sl2_hit:
-                    sl2 += 1
-                elif sl3_hit:
-                    sl3 += 1
+        debug_rows.append(
+            {
+                "ticker": symbol,
+                "timeframe": cfg.interval,
+                "max_leverage": max_leverage,
+                "entry_time_utc": pd.to_datetime(state["entry_time"], unit="s", utc=True),
+                "exit_time_utc": pd.to_datetime(row_time, unit="s", utc=True),
+                "direction": "LONG" if direction == 1 else "SHORT",
+                "result": result,
+                "sl_type": sl_type,
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+                "tp_price": state["tp_price"],
+                "sl1_price": state["sl1_price"],
+                "sl2_price": state["sl2_price"],
+                "sl2_active_at_exit": state["sl2_active"],
+                "sl3_price": state["sl3_price"],
+                "sl3_active_at_exit": state["sl3_active"],
+                "tp_hit": tp_hit,
+                "sl1_hit": sl1_hit,
+                "sl2_hit": sl2_hit,
+                "sl3_hit": sl3_hit,
+                "initial_risk_price": initial_risk,
+                "initial_sl1_price_pct": state["initial_sl1_price_pct"],
+                "initial_sl1_roi_pct": state["initial_sl1_roi_pct"],
+                "trade_r": trade_r,
+                "trade_price_pct": trade_price_pct,
+                "trade_roi_gross_pct": trade_roi_pct,
+                "capital_before_usdt": state["capital_before"],
+                "margin_used_usdt": margin,
+                "position_value_usdt": position_value,
+                "fee_usdt": fee,
+                "pnl_gross_usdt": pnl_gross,
+                "pnl_net_usdt": pnl_net,
+                "capital_after_usdt": capital,
+                "exit_candle_open": row["open"],
+                "exit_candle_high": row["high"],
+                "exit_candle_low": row["low"],
+                "exit_candle_close": row["close"],
+            }
+        )
 
-            state = reset_trade_state()
+        state = empty_state()
 
-    closed = tp + sl
-    wr = tp / closed * 100 if closed else None
-    sl_rate = sl / closed * 100 if closed else None
-    metrics_df = pd.DataFrame(trade_metric_rows)
+    closed = tp_count + sl_count
+    win_rate = tp_count / closed * 100.0 if closed else None
+    expectancy_r = net_r / closed if closed else None
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else None
+    expectancy_roi = (
+        (gross_profit - gross_loss) / total_margin_used * 100.0
+        if total_margin_used > 0
+        else None
+    )
+    return_pct = (
+        (capital - cfg.starting_capital) / cfg.starting_capital * 100.0
+        if cfg.starting_capital > 0
+        else 0.0
+    )
+    longest_win, longest_loss, current_streak = calculate_streaks(sequence)
 
-    def _mean_pnl(mask) -> Optional[float]:
-        if metrics_df.empty:
-            return None
-        values = metrics_df.loc[mask, "pnl_pct"]
-        return float(values.mean()) if not values.empty else None
-
-    avg_trade_pnl_pct = float(metrics_df["pnl_pct"].mean()) if not metrics_df.empty else None
-    avg_tp_pnl_pct = _mean_pnl(metrics_df["result"] == "TP") if not metrics_df.empty else None
-    avg_sl_pnl_pct = _mean_pnl(metrics_df["result"] == "SL") if not metrics_df.empty else None
-    avg_sl1_pnl_pct = _mean_pnl(metrics_df["sl_type"] == "SL1 MA50 entry") if not metrics_df.empty else None
-    avg_sl2_pnl_pct = _mean_pnl(metrics_df["sl_type"] == "SL2 HA flat") if not metrics_df.empty else None
-    avg_sl3_pnl_pct = _mean_pnl(metrics_df["sl_type"] == "SL3 MA50 cross") if not metrics_df.empty else None
-
-    if not metrics_df.empty:
-        sum_profit_pct = float(metrics_df.loc[metrics_df["pnl_pct"] > 0, "pnl_pct"].sum())
-        sum_loss_pct_abs = float(-metrics_df.loc[metrics_df["pnl_pct"] < 0, "pnl_pct"].sum())
-        profit_factor = (sum_profit_pct / sum_loss_pct_abs) if sum_loss_pct_abs > 0 else None
-        expectancy_pct = avg_trade_pnl_pct
-        avg_ma50_distance_entry_pct = float(metrics_df["ma50_distance_entry_pct"].mean())
-        sl1_dist = metrics_df.loc[metrics_df["sl_type"] == "SL1 MA50 entry", "ma50_distance_entry_pct"]
-        avg_ma50_distance_sl1_pct = float(sl1_dist.mean()) if not sl1_dist.empty else None
-    else:
-        sum_profit_pct = sum_loss_pct_abs = profit_factor = expectancy_pct = avg_ma50_distance_entry_pct = avg_ma50_distance_sl1_pct = None
-
-    max_losing_streak, max_winning_streak = streaks(seq)
-
-    score = None
+    score: Optional[float] = None
     if closed:
-        pf_component = min(profit_factor or 0, 3) * 5
-        expectancy_component = (expectancy_pct or 0) * 10
-        streak_penalty = max_losing_streak * 0.5
-        score = wr + min(total, 40) * 0.5 - sl1 * 2.0 + pf_component + expectancy_component - streak_penalty
+        # Ranking prioritizes real compounded return and penalizes drawdown.
+        pf_for_score = min(profit_factor if profit_factor is not None else 5.0, 5.0)
+        score = (
+            return_pct
+            + pf_for_score * 5.0
+            + (win_rate or 0.0) * 0.15
+            + min(closed, 50) * 0.20
+            + max_drawdown_pct * 0.50
+            - longest_loss * 0.75
+        )
 
     result = ScanResult(
         ticker=symbol,
+        timeframe=cfg.interval,
         max_leverage=max_leverage,
-        entries=total,
-        tp=tp,
-        sl=sl,
-        wr=wr,
-        sl_rate=sl_rate,
-        sl1=sl1,
-        sl2=sl2,
-        sl3=sl3,
-        ma200_raw=ma200_raw,
+        raw_signals=raw_signals,
+        entries=entries,
+        closed_trades=closed,
+        open_trade_at_end=bool(state["in_trade"]),
         skipped_cooldown=skipped_cooldown,
         skipped_in_trade=skipped_in_trade,
-        avg_trade_pnl_pct=avg_trade_pnl_pct,
-        avg_tp_pnl_pct=avg_tp_pnl_pct,
-        avg_sl_pnl_pct=avg_sl_pnl_pct,
-        avg_sl1_pnl_pct=avg_sl1_pnl_pct,
-        avg_sl2_pnl_pct=avg_sl2_pnl_pct,
-        avg_sl3_pnl_pct=avg_sl3_pnl_pct,
-        sum_profit_pct=sum_profit_pct,
-        sum_loss_pct_abs=sum_loss_pct_abs,
+        skipped_sl_too_large=skipped_sl_too_large,
+        tp=tp_count,
+        sl=sl_count,
+        sl1=sl1_count,
+        sl2=sl2_count,
+        sl3=sl3_count,
+        win_rate_pct=win_rate,
+        net_r=net_r,
+        expectancy_r=expectancy_r,
+        avg_sl1_price_pct=safe_mean(sl1_price_pcts),
+        median_sl1_price_pct=safe_median(sl1_price_pcts),
+        max_sl1_price_pct=safe_max(sl1_price_pcts),
+        avg_sl1_roi_pct=safe_mean(sl1_roi_pcts),
+        median_sl1_roi_pct=safe_median(sl1_roi_pcts),
+        max_sl1_roi_pct=safe_max(sl1_roi_pcts),
+        avg_tp_roi_pct=safe_mean(tp_roi_pcts),
+        median_tp_roi_pct=safe_median(tp_roi_pcts),
+        max_tp_roi_pct=safe_max(tp_roi_pcts),
+        gross_profit_usdt=gross_profit,
+        gross_loss_usdt=gross_loss,
+        total_fees_usdt=total_fees,
         profit_factor=profit_factor,
-        expectancy_pct=expectancy_pct,
-        avg_ma50_distance_entry_pct=avg_ma50_distance_entry_pct,
-        avg_ma50_distance_sl1_pct=avg_ma50_distance_sl1_pct,
-        sequence_last_30=" -> ".join(seq[-30:]),
-        max_losing_streak=max_losing_streak,
-        max_winning_streak=max_winning_streak,
+        expectancy_roi_pct=expectancy_roi,
+        starting_capital_usdt=cfg.starting_capital,
+        ending_capital_usdt=capital,
+        highest_capital_usdt=highest_capital,
+        return_on_capital_pct=return_pct,
+        max_drawdown_pct=max_drawdown_pct,
+        longest_win_streak=longest_win,
+        longest_loss_streak=longest_loss,
+        current_streak=current_streak,
+        sequence_last_30=" -> ".join(sequence[-30:]),
         score=score,
     )
-    return result, debug_trades
+    return result, debug_rows
 
 
-def main():
-    parser = argparse.ArgumentParser(description="MEXC futures scanner based on TradingView Pine logic")
-    parser.add_argument("--symbols", nargs="*", help="Examples: SUI_USDT ONDO_USDT VELVET_USDT")
-    parser.add_argument("--all", action="store_true", help="Scan all enabled USDT futures")
-    parser.add_argument("--limit", type=int, default=None, help="Limit number of symbols when using --all")
-    parser.add_argument("--min-max-leverage", type=int, default=None, help="Scan only symbols with max leverage >= this value, e.g. 100")
-    parser.add_argument("--days", type=int, default=14)
-    parser.add_argument("--tp", type=float, default=1.2)
-    parser.add_argument("--cooldown", type=int, default=480)
+def build_empty_result(
+    symbol: str,
+    cfg: ScanConfig,
+    max_leverage: Optional[int],
+) -> ScanResult:
+    return ScanResult(
+        ticker=symbol,
+        timeframe=cfg.interval,
+        max_leverage=max_leverage,
+        raw_signals=0,
+        entries=0,
+        closed_trades=0,
+        open_trade_at_end=False,
+        skipped_cooldown=0,
+        skipped_in_trade=0,
+        skipped_sl_too_large=0,
+        tp=0,
+        sl=0,
+        sl1=0,
+        sl2=0,
+        sl3=0,
+        win_rate_pct=None,
+        net_r=0.0,
+        expectancy_r=None,
+        avg_sl1_price_pct=None,
+        median_sl1_price_pct=None,
+        max_sl1_price_pct=None,
+        avg_sl1_roi_pct=None,
+        median_sl1_roi_pct=None,
+        max_sl1_roi_pct=None,
+        avg_tp_roi_pct=None,
+        median_tp_roi_pct=None,
+        max_tp_roi_pct=None,
+        gross_profit_usdt=0.0,
+        gross_loss_usdt=0.0,
+        total_fees_usdt=0.0,
+        profit_factor=None,
+        expectancy_roi_pct=None,
+        starting_capital_usdt=cfg.starting_capital,
+        ending_capital_usdt=cfg.starting_capital,
+        highest_capital_usdt=cfg.starting_capital,
+        return_on_capital_pct=0.0,
+        max_drawdown_pct=0.0,
+        longest_win_streak=0,
+        longest_loss_streak=0,
+        current_streak="-",
+        sequence_last_30="",
+        score=None,
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="MEXC scanner matching Pine 3xSL/5R with dynamic margin and taker fee."
+    )
+    parser.add_argument("--symbols", nargs="*", help="Example: SUI_USDT ONDO_USDT BTC_USDT")
+    parser.add_argument("--all", action="store_true", help="Scan all enabled USDT perpetual contracts")
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--min-max-leverage", type=int, default=None)
+    parser.add_argument("--interval", choices=sorted(INTERVAL_SECONDS), default="Min1")
+    parser.add_argument("--days", type=int, default=7)
+    parser.add_argument("--tp-r", type=float, default=5.0)
+    parser.add_argument("--max-sl1-roi", type=float, default=50.0)
+    parser.add_argument("--leverage", type=float, default=50.0)
+    parser.add_argument("--taker-fee", type=float, default=0.0008)
+    parser.add_argument("--margin-multiplier", type=float, default=10.0)
+    parser.add_argument("--starting-capital", type=float, default=5.0)
+    parser.add_argument("--cooldown", type=int, default=0)
+    parser.add_argument(
+        "--check-result-on-entry-bar",
+        action="store_true",
+        help="Match Pine when this checkbox is enabled.",
+    )
+    parser.add_argument(
+        "--tp-wins-same-candle",
+        action="store_true",
+        help="By default SL wins when TP and SL occur on the same candle.",
+    )
     parser.add_argument("--output", default="ranking.csv")
-    parser.add_argument("--debug-output", default=None, help="Optional. If set, saves per-trade debug CSV. Omit for faster/smaller production runs.")
-    args = parser.parse_args()
+    parser.add_argument("--debug-output", default="trades_debug.csv")
+    return parser.parse_args()
 
-    cfg = ScanConfig(tp_percent=args.tp, cooldown_minutes=args.cooldown, days=args.days)
 
-    print("Loading MEXC contract metadata...")
+def main() -> None:
+    args = parse_args()
+
+    if args.days <= 0:
+        raise SystemExit("--days must be > 0")
+    if args.leverage <= 0:
+        raise SystemExit("--leverage must be > 0")
+    if args.starting_capital <= 0:
+        raise SystemExit("--starting-capital must be > 0")
+    if args.margin_multiplier <= 0:
+        raise SystemExit("--margin-multiplier must be > 0")
+    if args.taker_fee < 0:
+        raise SystemExit("--taker-fee cannot be negative")
+
+    cfg = ScanConfig(
+        interval=args.interval,
+        days=args.days,
+        tp_r=args.tp_r,
+        max_sl1_roi_percent=args.max_sl1_roi,
+        leverage=args.leverage,
+        taker_fee=args.taker_fee,
+        margin_multiplier=args.margin_multiplier,
+        starting_capital=args.starting_capital,
+        cooldown_minutes=args.cooldown,
+        conservative_same_candle=not args.tp_wins_same_candle,
+        check_result_on_entry_bar=args.check_result_on_entry_bar,
+    )
+
+    print("Loading MEXC contract metadata...", flush=True)
     meta_map = get_contract_meta()
 
-    symbols = args.symbols or []
+    symbols = list(args.symbols or [])
     if args.all:
-        symbols = get_contract_symbols(limit=args.limit, min_max_leverage=args.min_max_leverage, meta=meta_map)
+        symbols = get_contract_symbols(
+            meta_map=meta_map,
+            min_max_leverage=args.min_max_leverage,
+            limit=args.limit,
+        )
     elif args.min_max_leverage is not None:
-        before = len(symbols)
         symbols = [
-            s for s in symbols
-            if meta_map.get(s) and meta_map[s].max_leverage is not None and meta_map[s].max_leverage >= args.min_max_leverage
+            symbol
+            for symbol in symbols
+            if symbol in meta_map
+            and meta_map[symbol].max_leverage is not None
+            and meta_map[symbol].max_leverage >= args.min_max_leverage
         ]
-        skipped = before - len(symbols)
-        if skipped:
-            print(f"Skipped {skipped} symbol(s) because max leverage < {args.min_max_leverage} or metadata missing.")
 
+    symbols = sorted(set(symbols))
     if not symbols:
-        raise SystemExit("Podaj --symbols SUI_USDT ONDO_USDT albo użyj --all. Dla filtra użyj np. --all --min-max-leverage 100")
+        raise SystemExit("Use --all or provide --symbols SUI_USDT BTC_USDT")
 
-    print(f"Symbols to scan: {len(symbols)}")
-    if args.min_max_leverage is not None:
-        print(f"Leverage filter: max_leverage >= {args.min_max_leverage}")
+    print(f"Symbols: {len(symbols)}", flush=True)
+    print(f"Config: {cfg}", flush=True)
 
-    results = []
-    all_debug_trades = []
+    ranking_rows: List[Dict[str, Any]] = []
+    debug_rows: List[Dict[str, Any]] = []
 
-    for n, symbol in enumerate(symbols, start=1):
+    for index, symbol in enumerate(symbols, start=1):
         max_lev = meta_map.get(symbol).max_leverage if meta_map.get(symbol) else None
-        print(f"[{n}/{len(symbols)}] scanning {symbol} | max_leverage={max_lev}...")
+        print(f"[{index}/{len(symbols)}] {symbol} | max leverage={max_lev}", flush=True)
 
-        success = False
+        completed = False
         for attempt in range(1, 4):
             try:
-                result, debug_trades = scan_symbol(symbol, cfg, meta_map.get(symbol))
-                results.append(asdict(result))
-                all_debug_trades.extend(debug_trades)
-                success = True
+                result, trades = scan_symbol(symbol, cfg, meta_map.get(symbol))
+                ranking_rows.append(asdict(result))
+                debug_rows.extend(trades)
+                completed = True
                 break
-            except Exception as e:
-                print(f"ERROR {symbol} attempt {attempt}/3: {e}")
+            except Exception as exc:
+                print(f"ERROR {symbol} attempt {attempt}/3: {exc}", flush=True)
                 if attempt < 3:
                     time.sleep(3 * attempt)
-        if not success:
-            print(f"FAILED {symbol} after 3 attempts")
 
-        time.sleep(0.12)
+        if not completed:
+            print(f"FAILED {symbol}", flush=True)
 
-    ranking_df = pd.DataFrame(results)
+        time.sleep(0.10)
+
+    ranking_df = pd.DataFrame(ranking_rows)
     if not ranking_df.empty:
         ranking_df = ranking_df.sort_values(
-            ["profit_factor", "expectancy_pct", "entries"],
-            ascending=[False, False, False],
+            by=["score", "return_on_capital_pct", "profit_factor", "closed_trades"],
+            ascending=[False, False, False, False],
             na_position="last",
         )
 
     ranking_df.to_csv(args.output, index=False)
 
-    if args.debug_output:
-        debug_df = pd.DataFrame(all_debug_trades)
-        if not debug_df.empty:
-            debug_df.to_csv(args.debug_output, index=False)
-        else:
-            pd.DataFrame(
-                columns=[
-                    "ticker", "max_leverage", "entry_time_utc", "exit_time_utc", "direction",
-                    "entry_price", "exit_price", "pnl_pct", "ma50_distance_entry_pct", "result", "sl_type",
-                ]
-            ).to_csv(args.debug_output, index=False)
+    debug_df = pd.DataFrame(debug_rows)
+    if debug_df.empty:
+        debug_df = pd.DataFrame(
+            columns=[
+                "ticker", "timeframe", "entry_time_utc", "exit_time_utc",
+                "direction", "result", "sl_type", "entry_price", "exit_price",
+                "trade_r", "trade_roi_gross_pct", "fee_usdt", "pnl_net_usdt",
+                "capital_before_usdt", "capital_after_usdt",
+            ]
+        )
+    debug_df.to_csv(args.debug_output, index=False)
 
-    print(ranking_df.head(30).to_string(index=False))
-    print(f"\nSaved ranking: {args.output}")
-    if args.debug_output:
-        print(f"Saved debug trades: {args.debug_output}")
+    print("\nTOP 30:", flush=True)
+    if ranking_df.empty:
+        print("No results.", flush=True)
+    else:
+        display_columns = [
+            "ticker", "timeframe", "entries", "tp", "sl", "win_rate_pct",
+            "profit_factor", "ending_capital_usdt", "return_on_capital_pct",
+            "max_drawdown_pct", "total_fees_usdt", "score",
+        ]
+        print(ranking_df[display_columns].head(30).to_string(index=False), flush=True)
+
+    print(f"\nSaved: {args.output}", flush=True)
+    print(f"Saved: {args.debug_output}", flush=True)
 
 
 if __name__ == "__main__":
