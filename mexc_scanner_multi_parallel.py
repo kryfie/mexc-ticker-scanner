@@ -399,10 +399,10 @@ def backtest_prepared(
     requested_start: int,
     cfg: ScanConfig,
     max_leverage: Optional[int],
-) -> Tuple[ScanResult, List[Dict[str, Any]]]:
+) -> Tuple[ScanResult, List[Dict[str, Any]], List[Dict[str, Any]]]:
     start_positions = prepared_df.index[prepared_df["time"] >= requested_start].tolist()
     if len(prepared_df) < 220 or not start_positions:
-        return build_empty_result(symbol, cfg, max_leverage), []
+        return build_empty_result(symbol, cfg, max_leverage), [], []
 
     first_scan_i = max(1, start_positions[0])
     state = empty_state()
@@ -423,6 +423,7 @@ def backtest_prepared(
     tp_roi_pcts: List[float] = []
     sequence: List[str] = []
     debug_rows: List[Dict[str, Any]] = []
+    signal_debug_rows: List[Dict[str, Any]] = []
 
     for i in range(first_scan_i, len(prepared_df)):
         row = prepared_df.iloc[i]
@@ -492,6 +493,69 @@ def backtest_prepared(
 
         ma200_up = ma200_up_raw and cooldown_ok and not state["in_trade"] and long_valid
         ma200_down = ma200_down_raw and cooldown_ok and not state["in_trade"] and short_valid
+
+        if raw_signal:
+            if not cooldown_ok:
+                rejection_reason = "COOLDOWN"
+            elif state["in_trade"]:
+                rejection_reason = "IN_TRADE"
+            elif ma200_up_raw and not long_valid:
+                rejection_reason = "SL1_ROI_TOO_LARGE_LONG"
+            elif ma200_down_raw and not short_valid:
+                rejection_reason = "SL1_ROI_TOO_LARGE_SHORT"
+            else:
+                rejection_reason = "ACCEPTED"
+
+            signal_debug_rows.append(
+                {
+                    "ticker": symbol,
+                    "timeframe": cfg.interval,
+                    "tp_r": cfg.tp_r,
+                    "max_sl1_roi_limit_pct": cfg.max_sl1_roi_percent,
+                    "bar_open_time_utc": pd.to_datetime(row_time, unit="s", utc=True),
+                    "bar_close_time_utc": pd.to_datetime(
+                        row_time + INTERVAL_SECONDS[cfg.interval], unit="s", utc=True
+                    ),
+                    "raw_direction": "LONG" if ma200_up_raw else "SHORT",
+                    "accepted": bool(ma200_up or ma200_down),
+                    "rejection_reason": rejection_reason,
+                    "in_trade_before_signal": bool(state["in_trade"]),
+                    "cooldown_ok": bool(cooldown_ok),
+                    "open": float(row["open"]),
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "close": float(row["close"]),
+                    "prev_ha_close": float(prev["ha_close"]),
+                    "ha_open": float(row["ha_open"]),
+                    "ha_close": float(row["ha_close"]),
+                    "ha_high": float(row["ha_high"]),
+                    "ha_low": float(row["ha_low"]),
+                    "ha_green": bool(ha_green),
+                    "ha_red": bool(ha_red),
+                    "ha_no_lower": bool(ha_no_lower),
+                    "ha_no_upper": bool(ha_no_upper),
+                    "prev_ma12": float(prev["ma12"]),
+                    "ma12": float(row["ma12"]),
+                    "prev_ma50": float(prev["ma50"]),
+                    "ma50": float(row["ma50"]),
+                    "prev_ma200": float(prev["ma200"]),
+                    "ma200": float(row["ma200"]),
+                    "cross_ha_up": bool(cross_ha_up),
+                    "cross_ha_down": bool(cross_ha_down),
+                    "cross_ma12_up": bool(cross_ma12_up),
+                    "cross_ma12_down": bool(cross_ma12_down),
+                    "cross_ma50_up": bool(cross_ma50_up),
+                    "cross_ma50_down": bool(cross_ma50_down),
+                    "candidate_entry_price": long_entry if ma200_up_raw else short_entry,
+                    "candidate_sl1_price": long_sl1 if ma200_up_raw else short_sl1,
+                    "candidate_sl1_price_pct": (
+                        long_sl1_price_pct if ma200_up_raw else short_sl1_price_pct
+                    ),
+                    "candidate_sl1_roi_pct": (
+                        long_sl1_roi_pct if ma200_up_raw else short_sl1_roi_pct
+                    ),
+                }
+            )
 
         if ma200_up or ma200_down:
             direction = 1 if ma200_up else -1
@@ -729,7 +793,7 @@ def backtest_prepared(
         current_streak=current_streak,
         sequence_last_30=" -> ".join(sequence[-30:]),
     )
-    return result, debug_rows
+    return result, debug_rows, signal_debug_rows
 
 
 def add_robustness(all_results: pd.DataFrame, total_configurations: int) -> pd.DataFrame:
@@ -836,6 +900,7 @@ def scan_symbol_interval_worker(task: Dict[str, Any]) -> Dict[str, Any]:
 
     result_rows: List[Dict[str, Any]] = []
     debug_rows: List[Dict[str, Any]] = []
+    signal_debug_rows: List[Dict[str, Any]] = []
 
     for tp_r in tp_r_values:
         for max_sl1_roi in max_sl1_roi_values:
@@ -852,7 +917,7 @@ def scan_symbol_interval_worker(task: Dict[str, Any]) -> Dict[str, Any]:
                 conservative_same_candle=bool(task["conservative_same_candle"]),
                 check_result_on_entry_bar=bool(task["check_result_on_entry_bar"]),
             )
-            result, trades = backtest_prepared(
+            result, trades, signals = backtest_prepared(
                 symbol=symbol,
                 prepared_df=prepared,
                 requested_start=requested_start,
@@ -870,12 +935,14 @@ def scan_symbol_interval_worker(task: Dict[str, Any]) -> Dict[str, Any]:
 
             if row["eligible_min_trades"]:
                 debug_rows.extend(trades)
+            signal_debug_rows.extend(signals)
 
     return {
         "symbol": symbol,
         "interval": interval,
         "results": result_rows,
         "debug": debug_rows,
+        "signals_debug": signal_debug_rows,
     }
 
 def parse_float_list(value: str) -> List[float]:
@@ -923,6 +990,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ranking-best", default="ranking_best_per_ticker.csv")
     parser.add_argument("--parameter-summary", default="parameter_summary.csv")
     parser.add_argument("--debug-output", default="trades_debug.csv")
+    parser.add_argument("--signals-debug-output", default="signals_debug.csv")
     return parser.parse_args()
 
 
@@ -967,6 +1035,7 @@ def main() -> None:
 
     all_rows: List[Dict[str, Any]] = []
     debug_rows: List[Dict[str, Any]] = []
+    signal_debug_rows: List[Dict[str, Any]] = []
     scan_end = int(time.time())
     requested_start = scan_end - args.days * 24 * 60 * 60
 
@@ -1017,6 +1086,7 @@ def main() -> None:
                 payload = future.result()
                 all_rows.extend(payload["results"])
                 debug_rows.extend(payload["debug"])
+                signal_debug_rows.extend(payload["signals_debug"])
                 completed_tasks += 1
                 print(
                     f"[{completed_tasks + failed_tasks}/{len(tasks)}] "
@@ -1073,6 +1143,19 @@ def main() -> None:
         )
     debug_df.to_csv(args.debug_output, index=False)
 
+    signals_debug_df = pd.DataFrame(signal_debug_rows)
+    if signals_debug_df.empty:
+        signals_debug_df = pd.DataFrame(
+            columns=[
+                "ticker", "timeframe", "tp_r", "max_sl1_roi_limit_pct",
+                "bar_open_time_utc", "bar_close_time_utc", "raw_direction",
+                "accepted", "rejection_reason", "open", "high", "low", "close",
+                "ha_open", "ha_close", "ha_high", "ha_low",
+                "ma12", "ma50", "ma200",
+            ]
+        )
+    signals_debug_df.to_csv(args.signals_debug_output, index=False)
+
     print("\nTOP 30 ELIGIBLE CONFIGURATIONS:", flush=True)
     if eligible.empty:
         print("No configurations reached the minimum closed-trade threshold.", flush=True)
@@ -1089,6 +1172,7 @@ def main() -> None:
     print(f"Saved: {args.ranking_best}", flush=True)
     print(f"Saved: {args.parameter_summary}", flush=True)
     print(f"Saved: {args.debug_output}", flush=True)
+    print(f"Saved: {args.signals_debug_output}", flush=True)
 
 
 if __name__ == "__main__":
