@@ -1,7 +1,57 @@
-name: MEXC Scanner Test
+name: MEXC Pine Scanner
 
 on:
   workflow_dispatch:
+    inputs:
+      interval:
+        description: "MEXC timeframe"
+        required: true
+        default: "Min1"
+        type: choice
+        options:
+          - Min1
+          - Min5
+          - Min15
+          - Min30
+          - Min60
+          - Hour4
+      days:
+        description: "Days to scan"
+        required: true
+        default: "7"
+      min_max_leverage:
+        description: "Minimum contract max leverage"
+        required: true
+        default: "50"
+      tp_r:
+        description: "TP as R multiple"
+        required: true
+        default: "5.0"
+      leverage:
+        description: "Backtest leverage"
+        required: true
+        default: "50"
+      max_sl1_roi:
+        description: "Maximum SL1 ROI percent"
+        required: true
+        default: "50"
+      starting_capital:
+        description: "Starting capital USDT"
+        required: true
+        default: "5"
+      margin_multiplier:
+        description: "Dynamic margin multiplier"
+        required: true
+        default: "10"
+      taker_fee:
+        description: "Taker fee per side: 0.0008 = 0.08%"
+        required: true
+        default: "0.0008"
+      cooldown:
+        description: "Cooldown in minutes"
+        required: true
+        default: "0"
+
   schedule:
     - cron: "0 6 * * *"
 
@@ -11,34 +61,67 @@ jobs:
     timeout-minutes: 720
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          pip install pandas requests
 
-      - name: Scan all futures x100+ 30d
+      - name: Resolve scanner settings
+        shell: bash
         run: |
-          python -u mexc_scanner.py --all --min-max-leverage 50 --days 7 --tp 7 --output ranking.csv --debug-output trades_debug.csv
+          echo "INTERVAL=${{ github.event.inputs.interval || 'Min1' }}" >> "$GITHUB_ENV"
+          echo "DAYS=${{ github.event.inputs.days || '7' }}" >> "$GITHUB_ENV"
+          echo "MIN_MAX_LEVERAGE=${{ github.event.inputs.min_max_leverage || '50' }}" >> "$GITHUB_ENV"
+          echo "TP_R=${{ github.event.inputs.tp_r || '5.0' }}" >> "$GITHUB_ENV"
+          echo "LEVERAGE=${{ github.event.inputs.leverage || '50' }}" >> "$GITHUB_ENV"
+          echo "MAX_SL1_ROI=${{ github.event.inputs.max_sl1_roi || '50' }}" >> "$GITHUB_ENV"
+          echo "STARTING_CAPITAL=${{ github.event.inputs.starting_capital || '5' }}" >> "$GITHUB_ENV"
+          echo "MARGIN_MULTIPLIER=${{ github.event.inputs.margin_multiplier || '10' }}" >> "$GITHUB_ENV"
+          echo "TAKER_FEE=${{ github.event.inputs.taker_fee || '0.0008' }}" >> "$GITHUB_ENV"
+          echo "COOLDOWN=${{ github.event.inputs.cooldown || '0' }}" >> "$GITHUB_ENV"
+
+      - name: Scan MEXC futures
+        run: |
+          python -u mexc_scanner.py \
+            --all \
+            --min-max-leverage "$MIN_MAX_LEVERAGE" \
+            --interval "$INTERVAL" \
+            --days "$DAYS" \
+            --tp-r "$TP_R" \
+            --leverage "$LEVERAGE" \
+            --max-sl1-roi "$MAX_SL1_ROI" \
+            --starting-capital "$STARTING_CAPITAL" \
+            --margin-multiplier "$MARGIN_MULTIPLIER" \
+            --taker-fee "$TAKER_FEE" \
+            --cooldown "$COOLDOWN" \
+            --output ranking.csv \
+            --debug-output trades_debug.csv
 
       - name: Show generated files
+        if: always()
         run: |
           ls -lah
-          echo "==== ranking.csv ===="
-          cat ranking.csv || true
+          echo "==== ranking.csv (first 31 lines) ===="
+          head -31 ranking.csv || true
           echo "==== trades_debug.csv (first 20 lines) ===="
           head -20 trades_debug.csv || true
 
-      - name: Upload files
+      - name: Upload scanner files
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scanner-output-30d
+          name: mexc-scanner-${{ env.INTERVAL }}-${{ env.DAYS }}d
+          if-no-files-found: warn
+          retention-days: 30
           path: |
             ranking.csv
             trades_debug.csv
