@@ -120,6 +120,34 @@ class ScanResult:
     net_pnl_usdt: float
     closed_trades: int
     open_trade_at_end: bool
+
+    # Direction split from the SAME combined backtest.
+    long_closed_trades: int
+    long_tp: int
+    long_sl: int
+    long_win_rate_pct: Optional[float]
+    long_net_r: float
+    long_expectancy_r: Optional[float]
+    long_gross_profit_usdt: float
+    long_gross_loss_usdt: float
+    long_profit_factor: Optional[float]
+    long_fees_usdt: float
+    long_net_pnl_usdt: float
+    long_avg_sl_roi_pct: Optional[float]
+
+    short_closed_trades: int
+    short_tp: int
+    short_sl: int
+    short_win_rate_pct: Optional[float]
+    short_net_r: float
+    short_expectancy_r: Optional[float]
+    short_gross_profit_usdt: float
+    short_gross_loss_usdt: float
+    short_profit_factor: Optional[float]
+    short_fees_usdt: float
+    short_net_pnl_usdt: float
+    short_avg_sl_roi_pct: Optional[float]
+
     scanner_score: Optional[float]
 
 
@@ -273,14 +301,78 @@ def streaks(seq: Iterable[str]) -> Tuple[int, int, str]:
 
 def empty_result(symbol: str, cfg: ScanConfig, meta: Optional[ContractMeta]) -> ScanResult:
     return ScanResult(
-        symbol, cfg.interval, cfg.days, meta.max_leverage if meta else None, False,
-        0, 0, 0, 0, 0, None, 0.0, None, None,
-        None, None, None, None, None, None, None, None, None,
-        0.0, 0.0, None,
-        cfg.starting_capital, cfg.starting_capital, cfg.starting_capital, 0.0, 0.0,
-        cfg.starting_capital * cfg.margin_multiplier / cfg.leverage,
-        0, 0, "-", cfg.cooldown_bars, 0, "Brak",
-        cfg.taker_fee * 100.0, 0.0, 0.0, 0.0, 0, False, None,
+        ticker=symbol,
+        timeframe=cfg.interval,
+        days=cfg.days,
+        max_leverage=meta.max_leverage if meta else None,
+        eligible_min_trades=False,
+        entries=0,
+        rejected_sl_roi=0,
+        rejected_cooldown=0,
+        tp=0,
+        sl=0,
+        win_rate_pct=None,
+        net_r=0.0,
+        expectancy_r=None,
+        expectancy_roi_pct_per_trade=None,
+        avg_sl_price_pct=None,
+        median_sl_price_pct=None,
+        max_sl_price_pct=None,
+        avg_sl_roi_pct=None,
+        median_sl_roi_pct=None,
+        max_sl_roi_pct_seen=None,
+        avg_tp_roi_pct=None,
+        median_tp_roi_pct=None,
+        max_tp_roi_pct=None,
+        gross_profit_usdt=0.0,
+        gross_loss_usdt=0.0,
+        profit_factor=None,
+        starting_capital_usdt=cfg.starting_capital,
+        ending_capital_usdt=cfg.starting_capital,
+        highest_capital_usdt=cfg.starting_capital,
+        return_on_capital_pct=0.0,
+        max_drawdown_pct=0.0,
+        current_margin_per_trade_usdt=cfg.starting_capital * cfg.margin_multiplier / cfg.leverage,
+        longest_win_streak=0,
+        longest_loss_streak=0,
+        current_streak="-",
+        cooldown_bars=cfg.cooldown_bars,
+        cooldown_remaining_bars=0,
+        status="Brak",
+        taker_fee_per_side_pct=cfg.taker_fee * 100.0,
+        avg_fee_per_closed_trade_usdt=0.0,
+        total_fees_usdt=0.0,
+        net_pnl_usdt=0.0,
+        closed_trades=0,
+        open_trade_at_end=False,
+
+        long_closed_trades=0,
+        long_tp=0,
+        long_sl=0,
+        long_win_rate_pct=None,
+        long_net_r=0.0,
+        long_expectancy_r=None,
+        long_gross_profit_usdt=0.0,
+        long_gross_loss_usdt=0.0,
+        long_profit_factor=None,
+        long_fees_usdt=0.0,
+        long_net_pnl_usdt=0.0,
+        long_avg_sl_roi_pct=None,
+
+        short_closed_trades=0,
+        short_tp=0,
+        short_sl=0,
+        short_win_rate_pct=None,
+        short_net_r=0.0,
+        short_expectancy_r=None,
+        short_gross_profit_usdt=0.0,
+        short_gross_loss_usdt=0.0,
+        short_profit_factor=None,
+        short_fees_usdt=0.0,
+        short_net_pnl_usdt=0.0,
+        short_avg_sl_roi_pct=None,
+
+        scanner_score=None,
     )
 
 
@@ -317,6 +409,23 @@ def scan_symbol(symbol: str, cfg: ScanConfig, meta: Optional[ContractMeta]) -> T
     max_dd = 0.0
     entries = rejected_sl = rejected_cd = wins = losses = closed = 0
     gp = gl = fees = sum_roi = 0.0
+
+    # Directional attribution of the exact same combined backtest.
+    dir_stats = {
+        "LONG": {
+            "closed": 0, "tp": 0, "sl": 0,
+            "gross_profit": 0.0, "gross_loss": 0.0,
+            "fees": 0.0, "net_pnl": 0.0,
+            "sl_roi_vals": [],
+        },
+        "SHORT": {
+            "closed": 0, "tp": 0, "sl": 0,
+            "gross_profit": 0.0, "gross_loss": 0.0,
+            "fees": 0.0, "net_pnl": 0.0,
+            "sl_roi_vals": [],
+        },
+    }
+
     sl_price_vals: List[float] = []
     sl_roi_vals: List[float] = []
     tp_roi_vals: List[float] = []
@@ -351,14 +460,26 @@ def scan_symbol(symbol: str, cfg: ScanConfig, meta: Optional[ContractMeta]) -> T
                 fees += trade_fee
                 sum_roi += trade_roi
                 closed += 1
+
+                direction_name = "LONG" if d == 1 else "SHORT"
+                ds = dir_stats[direction_name]
+                ds["closed"] += 1
+                ds["fees"] += trade_fee
+                ds["net_pnl"] += net
+                ds["sl_roi_vals"].append(float(position["sl_roi_pct"]))
+
                 if won:
                     wins += 1
                     gp += gross
+                    ds["tp"] += 1
+                    ds["gross_profit"] += gross
                     seq.append("TP")
                     result = "TP"
                 else:
                     losses += 1
                     gl += gross
+                    ds["sl"] += 1
+                    ds["gross_loss"] += gross
                     seq.append("SL")
                     result = "SL"
 
@@ -469,6 +590,37 @@ def scan_symbol(symbol: str, cfg: ScanConfig, meta: Optional[ContractMeta]) -> T
     cooldown_remaining = 0 if last_entry_i is None or cfg.cooldown_bars <= 0 else max(cfg.cooldown_bars - ((len(df) - 1) - last_entry_i), 0)
     status = "Brak" if position is None else ("LONG" if position["direction"] == 1 else "SHORT")
     eligible = closed >= cfg.min_closed_trades
+
+    def direction_metrics(name: str) -> Dict[str, Any]:
+        ds = dir_stats[name]
+        d_closed = int(ds["closed"])
+        d_tp = int(ds["tp"])
+        d_sl = int(ds["sl"])
+        d_wr = d_tp / d_closed * 100.0 if d_closed else None
+        d_net_r = d_tp * cfg.tp_r - d_sl
+        d_exp_r = d_net_r / d_closed if d_closed else None
+        d_gp = float(ds["gross_profit"])
+        d_gl = float(ds["gross_loss"])
+        d_pf = d_gp / abs(d_gl) if d_gl < 0 else (math.inf if d_gp > 0 else None)
+
+        return {
+            "closed": d_closed,
+            "tp": d_tp,
+            "sl": d_sl,
+            "win_rate": d_wr,
+            "net_r": d_net_r,
+            "expectancy_r": d_exp_r,
+            "gross_profit": d_gp,
+            "gross_loss": d_gl,
+            "profit_factor": d_pf,
+            "fees": float(ds["fees"]),
+            "net_pnl": float(ds["net_pnl"]),
+            "avg_sl_roi": sm(ds["sl_roi_vals"]),
+        }
+
+    long_m = direction_metrics("LONG")
+    short_m = direction_metrics("SHORT")
+
     score = None
     if closed:
         pf_score = min(pf if pf is not None and math.isfinite(pf) else 5.0, 5.0)
@@ -492,7 +644,35 @@ def scan_symbol(symbol: str, cfg: ScanConfig, meta: Optional[ContractMeta]) -> T
         cooldown_remaining_bars=cooldown_remaining, status=status,
         taker_fee_per_side_pct=cfg.taker_fee * 100.0,
         avg_fee_per_closed_trade_usdt=avg_fee, total_fees_usdt=fees, net_pnl_usdt=net_pnl,
-        closed_trades=closed, open_trade_at_end=position is not None, scanner_score=score,
+        closed_trades=closed, open_trade_at_end=position is not None,
+
+        long_closed_trades=long_m["closed"],
+        long_tp=long_m["tp"],
+        long_sl=long_m["sl"],
+        long_win_rate_pct=long_m["win_rate"],
+        long_net_r=long_m["net_r"],
+        long_expectancy_r=long_m["expectancy_r"],
+        long_gross_profit_usdt=long_m["gross_profit"],
+        long_gross_loss_usdt=long_m["gross_loss"],
+        long_profit_factor=long_m["profit_factor"],
+        long_fees_usdt=long_m["fees"],
+        long_net_pnl_usdt=long_m["net_pnl"],
+        long_avg_sl_roi_pct=long_m["avg_sl_roi"],
+
+        short_closed_trades=short_m["closed"],
+        short_tp=short_m["tp"],
+        short_sl=short_m["sl"],
+        short_win_rate_pct=short_m["win_rate"],
+        short_net_r=short_m["net_r"],
+        short_expectancy_r=short_m["expectancy_r"],
+        short_gross_profit_usdt=short_m["gross_profit"],
+        short_gross_loss_usdt=short_m["gross_loss"],
+        short_profit_factor=short_m["profit_factor"],
+        short_fees_usdt=short_m["fees"],
+        short_net_pnl_usdt=short_m["net_pnl"],
+        short_avg_sl_roi_pct=short_m["avg_sl_roi"],
+
+        scanner_score=score,
     )
     return result, debug
 
@@ -577,6 +757,13 @@ def main() -> None:
             "ticker", "timeframe", "entries", "tp", "sl", "win_rate_pct", "net_r",
             "expectancy_r", "expectancy_roi_pct_per_trade", "profit_factor",
             "ending_capital_usdt", "return_on_capital_pct", "max_drawdown_pct",
+
+            "long_closed_trades", "long_tp", "long_sl", "long_win_rate_pct",
+            "long_net_r", "long_expectancy_r", "long_profit_factor", "long_net_pnl_usdt",
+
+            "short_closed_trades", "short_tp", "short_sl", "short_win_rate_pct",
+            "short_net_r", "short_expectancy_r", "short_profit_factor", "short_net_pnl_usdt",
+
             "longest_loss_streak", "total_fees_usdt", "net_pnl_usdt",
             "closed_trades", "scanner_score",
         ]
