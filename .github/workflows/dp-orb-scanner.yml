@@ -1,0 +1,137 @@
+name: DP ORB MEXC Ticker Scanner
+
+on:
+  workflow_dispatch:
+    inputs:
+      interval:
+        description: "Timeframe"
+        required: true
+        default: "Min5"
+        type: choice
+        options:
+          - Min1
+          - Min5
+          - Min15
+          - Min30
+          - Min60
+      days:
+        description: "Recent days to backtest"
+        required: true
+        default: "90"
+      session_days:
+        description: "Pine days: 23456=Mon-Fri, 1234567=all days"
+        required: true
+        default: "23456"
+      min_max_leverage:
+        description: "Minimum supported contract leverage"
+        required: true
+        default: "20"
+      min_closed_trades:
+        description: "Minimum closed trades for eligible ranking"
+        required: true
+        default: "20"
+      leverage:
+        description: "Backtest leverage"
+        required: true
+        default: "20"
+      tp_r:
+        description: "Take Profit in R"
+        required: true
+        default: "5"
+      max_sl_roi:
+        description: "Reject entry above this SL ROI %"
+        required: true
+        default: "95"
+      starting_capital:
+        description: "Starting capital USDT"
+        required: true
+        default: "1"
+      margin_multiplier:
+        description: "Position notional = capital x multiplier"
+        required: true
+        default: "10"
+      taker_fee:
+        description: "Fee per side: 0.0008 = 0.08%"
+        required: true
+        default: "0.0008"
+      cooldown_bars:
+        description: "Cooldown after entry in candles"
+        required: true
+        default: "0"
+      workers:
+        description: "Parallel tickers; lower if rate-limited"
+        required: true
+        default: "8"
+      limit:
+        description: "0 = all tickers; e.g. 20 = quick test"
+        required: true
+        default: "0"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 720
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests
+
+      - name: Run DP ORB scanner
+        shell: bash
+        run: |
+          LIMIT_ARG=""
+          if [ "${{ github.event.inputs.limit }}" != "0" ]; then
+            LIMIT_ARG="--limit ${{ github.event.inputs.limit }}"
+          fi
+
+          python -u dp_orb_mexc_scanner.py \
+            --all \
+            $LIMIT_ARG \
+            --interval "${{ github.event.inputs.interval }}" \
+            --days "${{ github.event.inputs.days }}" \
+            --session-days "${{ github.event.inputs.session_days }}" \
+            --min-max-leverage "${{ github.event.inputs.min_max_leverage }}" \
+            --min-closed-trades "${{ github.event.inputs.min_closed_trades }}" \
+            --leverage "${{ github.event.inputs.leverage }}" \
+            --tp-r "${{ github.event.inputs.tp_r }}" \
+            --max-sl-roi "${{ github.event.inputs.max_sl_roi }}" \
+            --starting-capital "${{ github.event.inputs.starting_capital }}" \
+            --margin-multiplier "${{ github.event.inputs.margin_multiplier }}" \
+            --taker-fee "${{ github.event.inputs.taker_fee }}" \
+            --cooldown-bars "${{ github.event.inputs.cooldown_bars }}" \
+            --workers "${{ github.event.inputs.workers }}" \
+            --output ranking_dp_orb.csv \
+            --debug-output trades_dp_orb_debug.csv \
+            --errors-output errors_dp_orb.csv
+
+      - name: Show TOP 30
+        if: always()
+        run: |
+          echo "==== ranking_dp_orb.csv ===="
+          head -31 ranking_dp_orb.csv || true
+          echo
+          echo "==== errors_dp_orb.csv ===="
+          head -30 errors_dp_orb.csv || true
+
+      - name: Upload scanner results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dp-orb-scanner-${{ github.event.inputs.interval }}-${{ github.event.inputs.days }}d
+          if-no-files-found: warn
+          retention-days: 30
+          path: |
+            ranking_dp_orb.csv
+            trades_dp_orb_debug.csv
+            errors_dp_orb.csv
