@@ -1,0 +1,123 @@
+name: MEXC Robust Edge Scanner
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "0 = all MEXC USDT perpetuals; 20 = quick test"
+        required: true
+        default: "0"
+
+      workers:
+        description: "Parallel tickers. Reduce to 4 if MEXC rate-limits."
+        required: true
+        default: "6"
+
+      starting_capital:
+        description: "Starting capital in USDT"
+        required: true
+        default: "5"
+
+      leverage:
+        description: "Backtest leverage"
+        required: true
+        default: "10"
+
+      risk_pct:
+        description: "Target equity risk per trade, decimal (0.04 = 4%)"
+        required: true
+        default: "0.04"
+
+      max_margin_pct:
+        description: "Maximum isolated margin per trade, decimal (0.35 = 35%)"
+        required: true
+        default: "0.35"
+
+      fee:
+        description: "MEXC taker fee per side, decimal (0.0008 = 0.08%)"
+        required: true
+        default: "0.0008"
+
+      slippage:
+        description: "Modeled adverse slippage per side (0.0003 = 0.03%)"
+        required: true
+        default: "0.0003"
+
+      min_train_trades:
+        description: "Minimum trades in first 60 days to select a profile"
+        required: true
+        default: "18"
+
+      min_oos_trades:
+        description: "Minimum trades in untouched last 30 days"
+        required: true
+        default: "6"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 720
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests
+
+      - name: Run robust 90-day scanner
+        shell: bash
+        run: |
+          LIMIT="${{ github.event.inputs.limit || '0' }}"
+          LIMIT_ARG=""
+          if [ "$LIMIT" != "0" ]; then
+            LIMIT_ARG="--limit $LIMIT"
+          fi
+
+          python -u mexc_robust_edge_scanner.py \
+            --days 90 \
+            --train-days 60 \
+            --starting-capital "${{ github.event.inputs.starting_capital || '5' }}" \
+            --leverage "${{ github.event.inputs.leverage || '10' }}" \
+            --risk-pct "${{ github.event.inputs.risk_pct || '0.04' }}" \
+            --max-margin-pct "${{ github.event.inputs.max_margin_pct || '0.35' }}" \
+            --fee "${{ github.event.inputs.fee || '0.0008' }}" \
+            --slippage "${{ github.event.inputs.slippage || '0.0003' }}" \
+            --min-train-trades "${{ github.event.inputs.min_train_trades || '18' }}" \
+            --min-oos-trades "${{ github.event.inputs.min_oos_trades || '6' }}" \
+            --min-max-leverage 10 \
+            --workers "${{ github.event.inputs.workers || '6' }}" \
+            $LIMIT_ARG \
+            --ranking-output ranking_robust_edge.csv \
+            --trades-output trades_robust_edge.csv \
+            --profiles-output profile_train_results.csv \
+            --errors-output errors_robust_edge.csv
+
+      - name: Show TOP 30
+        if: always()
+        run: |
+          echo "===== TOP ranking ====="
+          head -31 ranking_robust_edge.csv || true
+          echo
+          echo "===== errors ====="
+          head -30 errors_robust_edge.csv || true
+
+      - name: Upload scanner results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mexc-robust-edge-90d
+          if-no-files-found: warn
+          retention-days: 30
+          path: |
+            ranking_robust_edge.csv
+            trades_robust_edge.csv
+            profile_train_results.csv
+            errors_robust_edge.csv
