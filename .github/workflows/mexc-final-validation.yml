@@ -1,0 +1,50 @@
+name: MEXC Final Validation
+
+on:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests
+
+      - name: Run frozen 90-day validation
+        run: |
+          python -u mexc_final_validation_scanner.py --days 90
+
+      - name: Show ranking
+        if: always()
+        run: |
+          echo "===== validation_ranking.csv ====="
+          cat validation_ranking.csv || true
+
+          echo
+          echo "===== validation_errors.csv ====="
+          cat validation_errors.csv || true
+
+      - name: Upload validation results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mexc-final-validation-90d
+          if-no-files-found: warn
+          retention-days: 30
+          path: |
+            validation_ranking.csv
+            validation_summary.csv
+            validation_trades.csv
+            validation_errors.csv
