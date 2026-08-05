@@ -1373,7 +1373,7 @@ def main() -> None:
                 for slippage in SLIPPAGE_SCENARIOS:
                     for window_name, start_ts, end_ts in windows:
                         metrics, trades = simulate(
-                            data=data,
+                            df=data,
                             profile=profile,
                             meta=meta,
                             start_ts=start_ts,
